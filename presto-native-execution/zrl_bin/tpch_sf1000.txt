@@ -1,0 +1,10 @@
+query_02.sql
+query_04.sql
+query_06.sql
+query_07.sql
+query_10.sql
+query_12.sql
+query_14.sql
+query_15.sql
+query_19.sql
+query_20.sql
