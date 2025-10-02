@@ -162,10 +162,21 @@ std::shared_ptr<std::thread> registerVeloxCudf() {
   facebook::velox::cudf_velox::CudfOptions::getInstance().setPrefix(
       SystemConfig::instance()->prestoDefaultNamespacePrefix());
   facebook::velox::cudf_velox::registerCudf();
-  auto server = facebook::velox::cudf_exchange::Communicator::initAndGet(SystemConfig::instance()->cudfServerPort());
-  if (server) {
-    serverThread = std::make_shared<std::thread>(
-        &facebook::velox::cudf_exchange::Communicator::run, server.get());
+
+  auto coordURL = SystemConfig::instance()->discoveryUri();
+
+  if (! coordURL.hasValue()) {
+     PRESTO_STARTUP_LOG(ERROR) << "No coordinator Uri, can't create CudfExchange";
+  } 
+  else {
+    std::string coordStr = coordURL.value();
+     PRESTO_STARTUP_LOG(INFO) <<  "In registerVeloxCudf " << coordStr;
+    auto server = facebook::velox::cudf_exchange::Communicator::initAndGet(
+        SystemConfig::instance()->cudfServerPort(), coordStr);
+    if (server) {
+      serverThread = std::make_shared<std::thread>(
+          &facebook::velox::cudf_exchange::Communicator::run, server.get());
+    }
   }
 
   PRESTO_STARTUP_LOG(INFO) << "cuDF is registered.";
@@ -175,7 +186,7 @@ std::shared_ptr<std::thread> registerVeloxCudf() {
 
 void unregisterVeloxCudf(std::shared_ptr<std::thread> serverThread) {
 #ifdef PRESTO_ENABLE_CUDF
-  auto server = facebook::velox::cudf_exchange::Communicator::initAndGet(SystemConfig::instance()->cudfServerPort());
+  auto server = facebook::velox::cudf_exchange::Communicator::initAndGet(SystemConfig::instance()->cudfServerPort(),nullptr);
   if (server) {
     server->stop();
     server.reset();
