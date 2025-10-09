@@ -186,14 +186,12 @@ std::shared_ptr<std::thread> registerVeloxCudf() {
 
 void unregisterVeloxCudf(std::shared_ptr<std::thread> serverThread) {
 #ifdef PRESTO_ENABLE_CUDF
-  auto server = facebook::velox::cudf_exchange::Communicator::initAndGet(SystemConfig::instance()->cudfServerPort(),nullptr);
-  if (server) {
-    server->stop();
-    server.reset();
-  }
   facebook::velox::cudf_velox::unregisterCudf();
   PRESTO_SHUTDOWN_LOG(INFO) << "cuDF is unregistered.";
   if (serverThread) {
+    auto server = facebook::velox::cudf_exchange::Communicator::getInstance();
+    server->stop();
+    server.reset();
     PRESTO_SHUTDOWN_LOG(INFO) << "Joining UCX Communicator thread.";
     serverThread->join();
   }
