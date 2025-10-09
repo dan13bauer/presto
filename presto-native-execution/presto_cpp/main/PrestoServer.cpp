@@ -70,6 +70,7 @@
 
 #ifdef PRESTO_ENABLE_CUDF
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/velox/experimental/cudf-exchange/Communicator.h"
 #endif
 
 #ifdef PRESTO_ENABLE_REMOTE_FUNCTIONS
@@ -155,19 +156,45 @@ bool isSharedLibrary(const fs::path& path) {
   return pathExt == kLinuxSharedLibExt || pathExt == kMacOSSharedLibExt;
 }
 
-void registerVeloxCudf() {
+std::shared_ptr<std::thread> registerVeloxCudf() {
+  std::shared_ptr<std::thread> serverThread = nullptr;
 #ifdef PRESTO_ENABLE_CUDF
   facebook::velox::cudf_velox::CudfOptions::getInstance().setPrefix(
       SystemConfig::instance()->prestoDefaultNamespacePrefix());
   facebook::velox::cudf_velox::registerCudf();
+
+  auto coordURL = SystemConfig::instance()->discoveryUri();
+
+  if (! coordURL.hasValue()) {
+     PRESTO_STARTUP_LOG(ERROR) << "No coordinator Uri, can't create CudfExchange";
+  } 
+  else {
+    std::string coordStr = coordURL.value();
+     PRESTO_STARTUP_LOG(INFO) <<  "In registerVeloxCudf " << coordStr;
+    auto server = facebook::velox::cudf_exchange::Communicator::initAndGet(
+        SystemConfig::instance()->cudfServerPort(), coordStr);
+    if (server) {
+      serverThread = std::make_shared<std::thread>(
+          &facebook::velox::cudf_exchange::Communicator::run, server.get());
+    }
+  }
+
   PRESTO_STARTUP_LOG(INFO) << "cuDF is registered.";
 #endif
+  return serverThread;
 }
 
-void unregisterVeloxCudf() {
+void unregisterVeloxCudf(std::shared_ptr<std::thread> serverThread) {
 #ifdef PRESTO_ENABLE_CUDF
   facebook::velox::cudf_velox::unregisterCudf();
   PRESTO_SHUTDOWN_LOG(INFO) << "cuDF is unregistered.";
+  if (serverThread) {
+    auto server = facebook::velox::cudf_exchange::Communicator::getInstance();
+    server->stop();
+    server.reset();
+    PRESTO_SHUTDOWN_LOG(INFO) << "Joining UCX Communicator thread.";
+    serverThread->join();
+  }
 #endif
 }
 
@@ -398,7 +425,7 @@ void PrestoServer::run() {
           });
     }
   }
-  registerVeloxCudf();
+  auto communicatorThread = registerVeloxCudf();
   registerFunctions();
   registerRemoteFunctions();
   registerVectorSerdes();
@@ -649,7 +676,7 @@ void PrestoServer::run() {
   unregisterFileReadersAndWriters();
   unregisterFileSystems();
   unregisterConnectors();
-  unregisterVeloxCudf();
+  unregisterVeloxCudf(communicatorThread);
 
   PRESTO_SHUTDOWN_LOG(INFO)
       << "Joining Driver CPU Executor '" << driverCpuExecutor_->getName()
