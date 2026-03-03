@@ -11,6 +11,19 @@
 # limitations under the License.
 cmake_minimum_required(VERSION 3.10)
 
+# Use rapids-cmake to configure CUDA architectures
+if(PRESTO_ENABLE_CUDF)
+  set(rapids-cmake-version 26.04)
+  if(NOT EXISTS ${CMAKE_CURRENT_BINARY_DIR}/PrestoCpp_RAPIDS.cmake)
+    file(DOWNLOAD https://raw.githubusercontent.com/rapidsai/rapids-cmake/refs/tags/v26.04.00a/RAPIDS.cmake
+      ${CMAKE_CURRENT_BINARY_DIR}/PrestoCpp_RAPIDS.cmake)
+  endif()
+  include(${CMAKE_CURRENT_BINARY_DIR}/PrestoCpp_RAPIDS.cmake)
+  include(rapids-cuda)
+  rapids_cuda_init_architectures(PrestoCpp)
+  enable_language(CUDA)
+endif()
+
 # set the project name
 project(PrestoCpp)
 
