@@ -2290,7 +2290,7 @@ core::PlanNodePtr VeloxQueryPlanConverterBase::toVeloxQueryPlan(
       toRowType(node->outputVariables, typeParser_),
       VectorSerde::Kind::kPresto,
       toVeloxQueryPlan(node->source, tableWriteInfo, taskId),
-      true);
+      core::PartitionedOutputNode::TransportType::kHttp);
 }
 
 core::PlanNodePtr VeloxInteractiveQueryPlanConverter::toVeloxQueryPlan(
