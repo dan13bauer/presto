@@ -65,7 +65,8 @@ RUN mkdir -p /gpu-tests && \
     if [[ "${EXTRA_CMAKE_FLAGS}" =~ -DVELOX_BUILD_GPU_TESTS=ON ]]; then \
         find /prestissimo/${BUILD_BASE_DIR}/${BUILD_DIR}/velox/velox/experimental/cudf/tests \
              /prestissimo/${BUILD_BASE_DIR}/${BUILD_DIR}/velox/velox/experimental/ucx-exchange/tests \
-             -maxdepth 1 -type f -executable ! -name "*s3*" -exec cp {} /gpu-tests/ \; ; \
+             -maxdepth 1 -type f -executable ! -name "*s3*" -exec cp {} /gpu-tests/ \; && \
+        cp /usr/lib64/libgtest.so* /usr/lib64/libgtest_main.so* /runtime-libraries/ ; \
     fi
 
 # ==========================================
