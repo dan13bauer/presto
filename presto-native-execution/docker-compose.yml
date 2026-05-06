@@ -36,7 +36,6 @@ services:
       context: .
       dockerfile: scripts/dockerfiles/prestissimo-runtime.dockerfile
 
-
   # ==========================================
   # CentOS services
   # ==========================================
@@ -59,6 +58,6 @@ services:
         # A few files in Velox require significant memory to compile and link.
         # Build requires 18GB of memory for 2 threads.
         - NUM_THREADS=2 # default value for NUM_THREADS
-        - EXTRA_CMAKE_FLAGS=-DPRESTO_ENABLE_TESTING=OFF -DPRESTO_ENABLE_PARQUET=ON -DPRESTO_ENABLE_S3=ON -DPRESTO_ENABLE_CUDF=${GPU:-OFF}
+        - EXTRA_CMAKE_FLAGS=-DPRESTO_ENABLE_TESTING=OFF -DPRESTO_ENABLE_PARQUET=ON -DPRESTO_ENABLE_S3=ON -DPRESTO_ENABLE_CUDF=${GPU:-OFF} -DVELOX_BUILD_GPU_TESTS=${GPU_TESTS:-OFF}
       context: .
       dockerfile: scripts/dockerfiles/prestissimo-runtime.dockerfile
