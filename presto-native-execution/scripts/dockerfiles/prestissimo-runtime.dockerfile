@@ -60,6 +60,14 @@ RUN !(LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:/usr/local/lib:/usr/local/lib64 ldd /pr
 RUN cp -rf /usr/local/lib/ucx /runtime-libraries/ucx
 RUN echo "${CUDA_VERSION}" > /cuda_version
 
+# Collect GPU test binaries (empty dir when VELOX_BUILD_GPU_TESTS is OFF)
+RUN mkdir -p /gpu-tests && \
+    if [[ "${EXTRA_CMAKE_FLAGS}" =~ -DVELOX_BUILD_GPU_TESTS=ON ]]; then \
+        find /prestissimo/${BUILD_BASE_DIR}/${BUILD_DIR}/velox/velox/experimental/cudf/tests \
+             /prestissimo/${BUILD_BASE_DIR}/${BUILD_DIR}/velox/velox/experimental/ucx-exchange/tests \
+             -maxdepth 1 -type f -executable ! -name "*s3*" -exec cp {} /gpu-tests/ \; ; \
+    fi
+
 # ==========================================
 # Stage 2: Runtime image (minimal, production-ready)
 # ==========================================
@@ -80,6 +88,7 @@ RUN CUDA_VERSION=$(cat /tmp/cuda_version) && \
     dnf clean all && \
     rm -rf /var/cache/dnf /tmp/scripts /tmp/cuda_version
 
+COPY --chmod=0775 --from=prestissimo-image /gpu-tests/ /opt/gpu-tests/
 COPY --chmod=0775 --from=prestissimo-image /prestissimo/${BUILD_BASE_DIR}/${BUILD_DIR}/presto_cpp/main/presto_server /usr/bin/
 COPY --chmod=0775 --from=prestissimo-image /runtime-libraries/* /usr/lib64/prestissimo-libs/
 COPY --chmod=0775 --from=prestissimo-image /runtime-libraries/ucx /usr/lib64/prestissimo-libs/ucx
@@ -93,5 +102,7 @@ RUN echo "/usr/lib64/prestissimo-libs" > /etc/ld.so.conf.d/prestissimo.conf && \
 RUN rpm --import https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub && \
     dnf config-manager --add-repo "https://developer.download.nvidia.com/devtools/repos/rhel$(source /etc/os-release; echo ${VERSION_ID%%.*})/$(rpm --eval '%{_arch}' | sed s/aarch/arm/)/" && \
     dnf install -y nsight-systems-cli
+
+COPY --chmod=0775 ./scripts/run-gpu-tests.sh /opt/run-gpu-tests.sh
 
 ENTRYPOINT ["/opt/entrypoint.sh"]
