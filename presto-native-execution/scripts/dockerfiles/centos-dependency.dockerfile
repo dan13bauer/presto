@@ -50,6 +50,15 @@ RUN bash -c "mkdir build && \
                  install_ucx) && \
     rm -rf build"
 
+RUN dnf install -y git make gcc && \
+  cd /tmp && \
+  git clone --depth 1 --branch v1.2.0 https://github.com/redis/hiredis.git && \
+  cd hiredis && \
+  make PREFIX=/usr LIBRARY_PATH=lib64 && \
+  make install PREFIX=/usr LIBRARY_PATH=lib64 && \
+  ldconfig && \
+  cd / && rm -rf /tmp/hiredis
+
 # Install sccache for optional S3-backed compile caching
 # See: https://github.com/mozilla/sccache
 ARG SCCACHE_VERSION="0.13.0"
