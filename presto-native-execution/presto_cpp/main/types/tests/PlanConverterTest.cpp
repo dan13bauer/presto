@@ -26,7 +26,7 @@
 #include "presto_cpp/main/types/PrestoToVeloxQueryPlan.h"
 #include "presto_cpp/main/types/tests/TestUtils.h"
 #include "velox/connectors/hive/TableHandle.h"
-#include "velox/core/ExchangeTransportType.h"
+#include "velox/core/PlanFragment.h"
 #include "velox/exec/tests/utils/TempDirectoryPath.h"
 
 using namespace facebook::presto;
@@ -337,14 +337,14 @@ TEST_F(PlanConverterTest, transportTypeAbsentDefaultsToHttp) {
       veloxFragment.planNode.get());
   ASSERT_NE(partitionedOutput, nullptr);
   ASSERT_EQ(
-      queryCtx->outputTransportType(partitionedOutput->id()),
-      core::ExchangeTransportType::kHttp);
+      veloxFragment.outputTransportType(partitionedOutput->id()),
+      core::TransportKind::kHttp);
 
   auto* exchange = findExchangeNode(veloxFragment.planNode);
   ASSERT_NE(exchange, nullptr);
   ASSERT_EQ(
-      queryCtx->inputTransportType(exchange->id()),
-      core::ExchangeTransportType::kHttp);
+      veloxFragment.inputTransportType(exchange->id()),
+      core::TransportKind::kHttp);
 }
 
 TEST_F(PlanConverterTest, transportTypeAny) {
@@ -365,14 +365,14 @@ TEST_F(PlanConverterTest, transportTypeAny) {
       veloxFragment.planNode.get());
   ASSERT_NE(partitionedOutput, nullptr);
   ASSERT_EQ(
-      queryCtx->outputTransportType(partitionedOutput->id()),
-      core::ExchangeTransportType::kUcx);
+      veloxFragment.outputTransportType(partitionedOutput->id()),
+      core::TransportKind::kUcx);
 
   auto* exchange = findExchangeNode(veloxFragment.planNode);
   ASSERT_NE(exchange, nullptr);
   ASSERT_EQ(
-      queryCtx->inputTransportType(exchange->id()),
-      core::ExchangeTransportType::kUcx);
+      veloxFragment.inputTransportType(exchange->id()),
+      core::TransportKind::kUcx);
 }
 
 TEST_F(PlanConverterTest, transportTypeHttp) {
@@ -393,12 +393,12 @@ TEST_F(PlanConverterTest, transportTypeHttp) {
       veloxFragment.planNode.get());
   ASSERT_NE(partitionedOutput, nullptr);
   ASSERT_EQ(
-      queryCtx->outputTransportType(partitionedOutput->id()),
-      core::ExchangeTransportType::kHttp);
+      veloxFragment.outputTransportType(partitionedOutput->id()),
+      core::TransportKind::kHttp);
 
   auto* exchange = findExchangeNode(veloxFragment.planNode);
   ASSERT_NE(exchange, nullptr);
   ASSERT_EQ(
-      queryCtx->inputTransportType(exchange->id()),
-      core::ExchangeTransportType::kHttp);
+      veloxFragment.inputTransportType(exchange->id()),
+      core::TransportKind::kHttp);
 }
