@@ -391,7 +391,7 @@ std::string toVeloxSerdeKind(protocol::ExchangeEncoding encoding) {
 
 // The coordinator sends ANY when the worker supports UCX transport.
 // In practice ANY means "use the fastest available transport" which is UCX.
-std::string toVeloxTransportType(
+std::string_view toVeloxTransportType(
     const std::shared_ptr<protocol::TransportType>& t) {
   if (!t) {
     return core::TransportKind::kHttp;
