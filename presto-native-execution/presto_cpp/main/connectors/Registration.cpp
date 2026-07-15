@@ -38,6 +38,13 @@ namespace {
 
 constexpr char const* kHiveHadoop2ConnectorName = "hive-hadoop2";
 constexpr char const* kIcebergConnectorName = "iceberg";
+#ifdef PRESTO_ENABLE_CUDF
+// The cuDF Iceberg connector is registered under its own name so it coexists
+// with (rather than replaces) the CPU Iceberg connector. Catalogs opt into
+// GPU-accelerated Iceberg reads via connector.name=cudf-iceberg; catalogs with
+// connector.name=iceberg continue to use the CPU connector.
+constexpr char const* kCudfIcebergConnectorName = "cudf-iceberg";
+#endif
 
 using ConnectorRegistry =
     std::unordered_map<std::string, std::function<void(const std::string&)>>;
@@ -120,8 +127,7 @@ void registerConnectors() {
   // with connector.name=cudf-iceberg coexist with CPU iceberg catalogs.
   registerPrestoToVeloxConnector(
       std::make_unique<IcebergPrestoToVeloxConnector>(
-          velox::cudf_velox::connector::hive::iceberg::
-              CudfIcebergConnectorFactory::kCudfIcebergConnectorName));
+          kCudfIcebergConnectorName));
 #endif
   registerPrestoToVeloxConnector(
       std::make_unique<TpchPrestoToVeloxConnector>(
@@ -201,9 +207,14 @@ void registerConnectorFactories() {
   // Register the cuDF Iceberg connector factory under its own name
   // ("cudf-iceberg") so it coexists with the CPU Iceberg connector. Catalogs
   // opt into GPU-accelerated Iceberg reads via connector.name=cudf-iceberg.
+  // NOTE: CudfIcebergConnectorFactory's default constructor names itself
+  // "iceberg" (same as the CPU factory registered above), so it MUST be
+  // constructed with the explicit connector-name ctor or startup would fail
+  // with "ConnectorFactory with name 'iceberg' is already registered".
   facebook::presto::registerConnectorFactory(
       std::make_shared<facebook::velox::cudf_velox::connector::hive::iceberg::
-                           CudfIcebergConnectorFactory>());
+                           CudfIcebergConnectorFactory>(
+          kCudfIcebergConnectorName));
 #endif
 
 #ifdef PRESTO_ENABLE_ARROW_FLIGHT_CONNECTOR
