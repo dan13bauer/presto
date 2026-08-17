@@ -324,9 +324,8 @@ class MaterializedExchangeTest : public exec::test::OperatorTestBase {
 
     exec::Operator::registerOperator(
         std::make_unique<MaterializedOutputTranslator>());
-    exec::Operator::registerOperator(
-        std::make_unique<MaterializedExchangeTranslator>());
-    exec::Operator::registerOperator(std::make_unique<ShuffleReadTranslator>());
+    registerMaterializedExchangeTransport();
+    registerShuffleReadTransport();
 
     shuffleName_ = std::string(LocalPersistentShuffleFactory::kShuffleName);
     exec::ExchangeSource::factories().clear();

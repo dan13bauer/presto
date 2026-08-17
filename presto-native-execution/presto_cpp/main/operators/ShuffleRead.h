@@ -15,13 +15,23 @@
 
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Exchange.h"
+#include "velox/exec/InMemoryExchangeClient.h"
 #include "velox/exec/Operator.h"
 
 namespace facebook::presto::operators {
-class ShuffleReadNode : public velox::core::PlanNode {
+class ShuffleReadNode : public velox::core::ExchangeNode {
  public:
+  /// Transport id under which ShuffleRead registers its operator. The wire
+  /// transport is the in-memory one; this id exists so the exchange transport
+  /// registry resolves to ShuffleRead rather than to a plain Exchange.
+  static constexpr std::string_view kTransportKind{"presto-shuffle-read"};
+
   ShuffleReadNode(const velox::core::PlanNodeId& id, velox::RowTypePtr type)
-      : PlanNode(id), outputType_(type) {}
+      : ExchangeNode(
+            id,
+            std::move(type),
+            "CompactRow",
+            std::string{kTransportKind}) {}
 
   class Builder {
    public:
@@ -62,23 +72,6 @@ class ShuffleReadNode : public velox::core::PlanNode {
       const folly::dynamic& obj,
       void* context);
 
-  const velox::RowTypePtr& outputType() const override {
-    return outputType_;
-  }
-
-  const std::vector<velox::core::PlanNodePtr>& sources() const override {
-    static const std::vector<velox::core::PlanNodePtr> kEmptySources;
-    return kEmptySources;
-  }
-
-  bool requiresExchangeClient() const override {
-    return true;
-  }
-
-  bool requiresSplits() const override {
-    return true;
-  }
-
   std::string_view name() const override {
     return "ShuffleRead";
   }
@@ -87,8 +80,6 @@ class ShuffleReadNode : public velox::core::PlanNode {
   void addDetails(std::stringstream& stream) const override {
     // Nothing to add
   }
-
-  const velox::RowTypePtr outputType_;
 };
 
 class ShuffleRead : public velox::exec::Exchange {
@@ -97,7 +88,7 @@ class ShuffleRead : public velox::exec::Exchange {
       int32_t operatorId,
       velox::exec::DriverCtx* ctx,
       const std::shared_ptr<const ShuffleReadNode>& shuffleReadNode,
-      std::shared_ptr<velox::exec::ExchangeClient> exchangeClient);
+      std::shared_ptr<velox::exec::InMemoryExchangeClient> exchangeClient);
 
   velox::RowVectorPtr getOutput() override;
 
@@ -128,12 +119,9 @@ class ShuffleRead : public velox::exec::Exchange {
   std::vector<size_t> pageRows_;
 };
 
-class ShuffleReadTranslator : public velox::exec::Operator::PlanNodeTranslator {
- public:
-  std::unique_ptr<velox::exec::Operator> toOperator(
-      velox::exec::DriverCtx* ctx,
-      int32_t id,
-      const velox::core::PlanNodePtr& node,
-      std::shared_ptr<velox::exec::ExchangeClient> exchangeClient) override;
-};
+/// Registers the ShuffleRead exchange transport under
+/// ShuffleReadNode::kTransportKind, pairing the built-in in-memory exchange
+/// client with the ShuffleRead operator. Must run before any task is created.
+/// Idempotent.
+void registerShuffleReadTransport();
 } // namespace facebook::presto::operators

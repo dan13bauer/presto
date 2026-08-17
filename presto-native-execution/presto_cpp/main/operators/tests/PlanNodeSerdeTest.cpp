@@ -13,6 +13,8 @@
  */
 #include <gtest/gtest.h>
 
+#include "presto_cpp/main/operators/MaterializedExchange.h"
+#include "presto_cpp/main/operators/ShuffleRead.h"
 #include "presto_cpp/main/operators/tests/PlanBuilder.h"
 #include "presto_cpp/main/types/PrestoToVeloxQueryPlan.h"
 #include "velox/core/PlanNode.h"
@@ -86,6 +88,30 @@ TEST_F(PlanNodeSerdeTest, shuffleReadNode) {
                   .project(type_->names())
                   .planNode();
   testSerde(plan);
+}
+
+TEST_F(PlanNodeSerdeTest, shuffleReadNodeIsAnExchangeNode) {
+  auto node = std::make_shared<ShuffleReadNode>("0", type_);
+
+  // Being an ExchangeNode is what makes the runtime create an exchange client
+  // for this node: DriverFactory::needsExchangeClient() matches by type.
+  EXPECT_NE(dynamic_cast<const core::ExchangeNode*>(node.get()), nullptr);
+  // The registry resolves the operator by transport id, so the id is part of
+  // the node's contract, not an implementation detail.
+  EXPECT_EQ(node->transportKind(), ShuffleReadNode::kTransportKind);
+  EXPECT_EQ(node->serdeKind(), "CompactRow");
+  EXPECT_TRUE(node->requiresSplits());
+  EXPECT_TRUE(node->sources().empty());
+}
+
+TEST_F(PlanNodeSerdeTest, materializedExchangeNodeIsAnExchangeNode) {
+  auto node = std::make_shared<MaterializedExchangeNode>("0", type_);
+
+  EXPECT_NE(dynamic_cast<const core::ExchangeNode*>(node.get()), nullptr);
+  EXPECT_EQ(node->transportKind(), MaterializedExchangeNode::kTransportKind);
+  EXPECT_EQ(node->serdeKind(), "CompactRow");
+  EXPECT_TRUE(node->requiresSplits());
+  EXPECT_TRUE(node->sources().empty());
 }
 
 TEST_F(PlanNodeSerdeTest, shuffleWriteNode) {

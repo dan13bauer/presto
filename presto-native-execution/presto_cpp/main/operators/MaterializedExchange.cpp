@@ -17,6 +17,7 @@
 #include <cstring>
 
 #include "presto_cpp/main/operators/ShuffleExchangeSource.h"
+#include "velox/exec/ExchangeTransportRegistry.h"
 #include "velox/row/CompactRow.h"
 #include "velox/serializers/RowSerializer.h"
 
@@ -33,8 +34,12 @@ core::PlanNodeId deserializeMaterializedExchangeNodeId(
 } // namespace
 
 folly::dynamic MaterializedExchangeNode::serialize() const {
+  // Deliberately PlanNode::serialize(), not ExchangeNode::serialize(): the
+  // serde kind and transport id are constants of this class rather than data,
+  // so the serialized form stays exactly what it was before
+  // MaterializedExchangeNode became an ExchangeNode.
   auto obj = PlanNode::serialize();
-  obj["outputType"] = outputType_->serialize();
+  obj["outputType"] = outputType()->serialize();
   return obj;
 }
 
@@ -51,19 +56,12 @@ MaterializedExchange::MaterializedExchange(
     DriverCtx* ctx,
     const std::shared_ptr<const MaterializedExchangeNode>&
         materializedExchangeNode,
-    std::shared_ptr<ExchangeClient> exchangeClient)
+    std::shared_ptr<InMemoryExchangeClient> exchangeClient)
     : Exchange(
           operatorId,
           ctx,
-          // A stand-in node for the Exchange base class. Its transport is
-          // never resolved -- the client is handed in directly -- so name the
-          // in-memory default rather than plumb one through.
-          std::make_shared<core::ExchangeNode>(
-              materializedExchangeNode->id(),
-              materializedExchangeNode->outputType(),
-              "CompactRow",
-              std::string{core::TransportKind::kInMemory}),
-          exchangeClient,
+          materializedExchangeNode,
+          std::move(exchangeClient),
           "MaterializedExchange") {}
 
 void MaterializedExchange::resetOutputState() {
@@ -199,17 +197,46 @@ void MaterializedExchange::expandBatchedPage(std::string_view pageData) {
   }
 }
 
-std::unique_ptr<Operator> MaterializedExchangeTranslator::toOperator(
-    DriverCtx* ctx,
-    int32_t id,
-    const core::PlanNodePtr& node,
-    std::shared_ptr<ExchangeClient> exchangeClient) {
-  if (auto materializedExchangeNode =
-          std::dynamic_pointer_cast<const MaterializedExchangeNode>(node)) {
+void registerMaterializedExchangeTransport() {
+  const auto inMemory = ExchangeTransportRegistry::tryGet(
+      std::string{core::TransportKind::kInMemory});
+  VELOX_CHECK_NOT_NULL(
+      inMemory,
+      "MaterializedExchange requires the built-in in-memory exchange "
+      "transport");
+
+  auto entry = std::make_shared<ExchangeTransportEntry>();
+  // The data plane is the in-memory one -- only the ExchangeSource differs, and
+  // that is chosen per URL scheme -- so reuse its client factory rather than
+  // duplicating the query-config plumbing it reads.
+  entry->makeClient = inMemory->makeClient;
+  entry->makeOperator =
+      [](int32_t operatorId,
+         DriverCtx* ctx,
+         const std::shared_ptr<const core::ExchangeNode>& node,
+         std::shared_ptr<ExchangeClient> client) -> std::unique_ptr<Operator> {
+    auto materializedExchangeNode =
+        std::dynamic_pointer_cast<const MaterializedExchangeNode>(node);
+    VELOX_CHECK_NOT_NULL(
+        materializedExchangeNode,
+        "Transport '{}' is reserved for MaterializedExchangeNode, got plan "
+        "node: {}",
+        MaterializedExchangeNode::kTransportKind,
+        node->id());
+    auto inMemoryClient =
+        std::dynamic_pointer_cast<InMemoryExchangeClient>(std::move(client));
+    VELOX_CHECK_NOT_NULL(
+        inMemoryClient,
+        "MaterializedExchange requires an InMemoryExchangeClient");
     return std::make_unique<MaterializedExchange>(
-        id, ctx, materializedExchangeNode, exchangeClient);
-  }
-  return nullptr;
+        operatorId, ctx, materializedExchangeNode, std::move(inMemoryClient));
+  };
+  // 'overwrite' keeps a second call a no-op instead of throwing on the
+  // duplicate key.
+  ExchangeTransportRegistry::global().insert(
+      std::string{MaterializedExchangeNode::kTransportKind},
+      std::move(entry),
+      /*overwrite=*/true);
 }
 
 } // namespace facebook::presto::operators

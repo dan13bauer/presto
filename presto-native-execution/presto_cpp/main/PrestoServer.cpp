@@ -1568,12 +1568,13 @@ void PrestoServer::registerCustomOperators() {
       std::make_unique<operators::PartitionAndSerializeTranslator>());
   velox::exec::Operator::registerOperator(
       std::make_unique<operators::ShuffleWriteTranslator>());
-  velox::exec::Operator::registerOperator(
-      std::make_unique<operators::ShuffleReadTranslator>());
+  // ShuffleReadNode and MaterializedExchangeNode are ExchangeNodes, so their
+  // operators are resolved from the exchange transport registry rather than by
+  // an operator translator.
+  operators::registerShuffleReadTransport();
   velox::exec::Operator::registerOperator(
       std::make_unique<operators::MaterializedOutputTranslator>());
-  velox::exec::Operator::registerOperator(
-      std::make_unique<operators::MaterializedExchangeTranslator>());
+  operators::registerMaterializedExchangeTransport();
 
   // Todo - Split Presto & Presto-on-Spark server into different classes
   // which will allow server specific operator registration.

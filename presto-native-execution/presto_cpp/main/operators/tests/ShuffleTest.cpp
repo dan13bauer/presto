@@ -183,7 +183,7 @@ class ShuffleTest : public exec::test::OperatorTestBase {
         std::make_unique<PartitionAndSerializeTranslator>());
     exec::Operator::registerOperator(
         std::make_unique<ShuffleWriteTranslator>());
-    exec::Operator::registerOperator(std::make_unique<ShuffleReadTranslator>());
+    registerShuffleReadTransport();
 
     shuffleName_ = LocalPersistentShuffleFactory::kShuffleName;
     exec::ExchangeSource::factories().clear();
@@ -318,7 +318,7 @@ class ShuffleTest : public exec::test::OperatorTestBase {
         std::make_unique<PartitionAndSerializeTranslator>());
     exec::Operator::registerOperator(
         std::make_unique<ShuffleWriteTranslator>());
-    exec::Operator::registerOperator(std::make_unique<ShuffleReadTranslator>());
+    registerShuffleReadTransport();
 
     // Flatten the inputs to avoid issues assertEqualResults referred here:
     // https://github.com/facebookincubator/velox/issues/2859
@@ -956,7 +956,7 @@ DEBUG_ONLY_TEST_F(ShuffleTest, shuffleReaderExceptions) {
         VELOX_CHECK(nullFunction());
       };
 
-  exec::Operator::registerOperator(std::make_unique<ShuffleReadTranslator>());
+  registerShuffleReadTransport();
   velox::exec::ExchangeSource::factories().clear();
   registerExchangeSource(std::string(shuffleName_));
 
@@ -1258,7 +1258,7 @@ TEST_F(ShuffleTest, shuffleReadRuntimeStats) {
   const size_t numMapDrivers = 1;
 
   exec::Operator::registerOperator(std::make_unique<ShuffleWriteTranslator>());
-  exec::Operator::registerOperator(std::make_unique<ShuffleReadTranslator>());
+  registerShuffleReadTransport();
   velox::exec::ExchangeSource::factories().clear();
   registerExchangeSource(std::string(shuffleName_));
 

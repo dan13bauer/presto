@@ -15,37 +15,35 @@
 
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Exchange.h"
+#include "velox/exec/InMemoryExchangeClient.h"
 #include "velox/exec/Operator.h"
 
 namespace facebook::presto::operators {
 
 /// Plan node for reading shuffle data written by MaterializedOutput.
 /// Paired with MaterializedOutputNode for symmetric A/B switching.
-class MaterializedExchangeNode : public velox::core::PlanNode {
+///
+/// An ExchangeNode, so the runtime creates an exchange client for it and
+/// resolves its operator from the exchange transport registry. Being a leaf,
+/// its data arrives through that client from splits (RemoteConnectorSplit)
+/// rather than from upstream operators.
+class MaterializedExchangeNode : public velox::core::ExchangeNode {
  public:
+  /// Transport id under which MaterializedExchange registers its operator. The
+  /// wire transport is the in-memory one; this id exists so the exchange
+  /// transport registry resolves to MaterializedExchange rather than to a plain
+  /// Exchange.
+  static constexpr std::string_view kTransportKind{
+      "presto-materialized-exchange"};
+
   MaterializedExchangeNode(
       const velox::core::PlanNodeId& id,
       velox::RowTypePtr outputType)
-      : PlanNode(id), outputType_(std::move(outputType)) {}
-
-  const velox::RowTypePtr& outputType() const override {
-    return outputType_;
-  }
-
-  /// Leaf node — no child plan nodes. Data comes from ExchangeClient via
-  /// splits (RemoteConnectorSplit), not from upstream operators.
-  const std::vector<velox::core::PlanNodePtr>& sources() const override {
-    static const std::vector<velox::core::PlanNodePtr> kEmptySources;
-    return kEmptySources;
-  }
-
-  bool requiresExchangeClient() const override {
-    return true;
-  }
-
-  bool requiresSplits() const override {
-    return true;
-  }
+      : ExchangeNode(
+            id,
+            std::move(outputType),
+            "CompactRow",
+            std::string{kTransportKind}) {}
 
   std::string_view name() const override {
     return "MaterializedExchange";
@@ -59,8 +57,6 @@ class MaterializedExchangeNode : public velox::core::PlanNode {
 
  private:
   void addDetails(std::stringstream& /* stream */) const override {}
-
-  const velox::RowTypePtr outputType_;
 };
 
 /// Operator for reading shuffle data written by MaterializedOutput.
@@ -87,7 +83,7 @@ class MaterializedExchange : public velox::exec::Exchange {
       velox::exec::DriverCtx* ctx,
       const std::shared_ptr<const MaterializedExchangeNode>&
           materializedExchangeNode,
-      std::shared_ptr<velox::exec::ExchangeClient> exchangeClient);
+      std::shared_ptr<velox::exec::InMemoryExchangeClient> exchangeClient);
 
   velox::RowVectorPtr getOutput() override;
 
@@ -126,16 +122,10 @@ class MaterializedExchange : public velox::exec::Exchange {
   size_t nextRow_{0};
 };
 
-/// Translator that creates MaterializedExchange operators from
-/// MaterializedExchangeNode.
-class MaterializedExchangeTranslator
-    : public velox::exec::Operator::PlanNodeTranslator {
- public:
-  std::unique_ptr<velox::exec::Operator> toOperator(
-      velox::exec::DriverCtx* ctx,
-      int32_t id,
-      const velox::core::PlanNodePtr& node,
-      std::shared_ptr<velox::exec::ExchangeClient> exchangeClient) override;
-};
+/// Registers the MaterializedExchange transport under
+/// MaterializedExchangeNode::kTransportKind, pairing the built-in in-memory
+/// exchange client with the MaterializedExchange operator. Must run before any
+/// task is created. Idempotent.
+void registerMaterializedExchangeTransport();
 
 } // namespace facebook::presto::operators
