@@ -21,7 +21,9 @@
 #include <velox/type/TypeUtil.h>
 #include <velox/type/Filter.h>
 #include "velox/core/QueryCtx.h"
+#include "velox/exec/ExchangeTransportRegistry.h"
 #include "velox/exec/HashPartitionFunction.h"
+#include "velox/exec/OutputTransportRegistry.h"
 #include "velox/exec/RoundRobinPartitionFunction.h"
 #include "velox/expression/Expr.h"
 #include "velox/vector/ComplexVector.h"
@@ -389,20 +391,28 @@ std::string toVeloxSerdeKind(protocol::ExchangeEncoding encoding) {
   VELOX_UNSUPPORTED("Unsupported encoding: {}.", fmt::underlying(encoding));
 }
 
-// The coordinator sends ANY when the worker supports UCX transport.
-// In practice ANY means "use the fastest available transport" which is UCX.
-std::string_view toVeloxTransportType(
-    const std::shared_ptr<protocol::TransportType>& t) {
-  if (!t) {
-    return core::TransportKind::kHttp;
+// Resolves the Velox transport for one exchange edge. The coordinator
+// annotates worker-to-worker edges with ANY -- "any transport the workers
+// support" -- without knowing which transports this worker registered, so ANY
+// alone is not enough to select UCX. Requiring an entry in both registries is
+// the same precondition Task and LocalPlanner enforce when they resolve a
+// node's transport, so a plan built here can never name a transport that fails
+// to resolve at execution time. Everything else, including an unrecognized
+// annotation from a newer coordinator, resolves to the in-memory default,
+// which Presto serves over HTTP.
+std::string toVeloxTransportKind(
+    const std::shared_ptr<protocol::TransportType>& transportType,
+    const core::QueryCtx& queryCtx) {
+  auto inMemory = std::string{core::TransportKind::kInMemory};
+  if (transportType == nullptr ||
+      *transportType != protocol::TransportType::ANY) {
+    return inMemory;
   }
-  switch (*t) {
-    case protocol::TransportType::HTTP:
-      return core::TransportKind::kHttp;
-    case protocol::TransportType::ANY:
-      return core::TransportKind::kUcx;
-  }
-  VELOX_UNSUPPORTED("Unsupported transport type: {}.", fmt::underlying(*t));
+  auto ucx = std::string{core::TransportKind::kUcx};
+  const bool ucxRegistered =
+      exec::ExchangeTransportRegistry::tryGet(queryCtx, ucx) != nullptr &&
+      exec::OutputTransportRegistry::tryGet(queryCtx, ucx) != nullptr;
+  return ucxRegistered ? std::move(ucx) : std::move(inMemory);
 }
 
 std::shared_ptr<core::LocalPartitionNode> buildLocalSystemPartitionNode(
@@ -2739,7 +2749,6 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
     const std::shared_ptr<protocol::TableWriteInfo>& tableWriteInfo,
     const protocol::TaskId& taskId) {
   core::PlanFragment planFragment;
-  planFragment_ = &planFragment;
 
   // Convert the fragment info first.
   const auto& descriptor = fragment.stageExecutionDescriptor;
@@ -2794,8 +2803,6 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
   auto outputType = toRowType(partitioningScheme.outputLayout, typeParser_);
   const auto partitionedOutputNodeId =
       toPartitionedOutputNodeId(fragment.root->id);
-  planFragment.outputTransportTypes[partitionedOutputNodeId] =
-      toVeloxTransportType(fragment.outputTransportType);
 
   if (auto systemPartitioningHandle =
           std::dynamic_pointer_cast<protocol::SystemPartitioningHandle>(
@@ -2947,9 +2954,8 @@ core::PlanNodePtr VeloxInteractiveQueryPlanConverter::toVeloxQueryPlan(
     const std::shared_ptr<const protocol::RemoteSourceNode>& node,
     const std::shared_ptr<protocol::TableWriteInfo>& /*tableWriteInfo*/,
     const protocol::TaskId& taskId) {
-  planFragment_->inputTransportTypes[node->id] =
-      toVeloxTransportType(node->transportType);
   auto rowType = toRowType(node->outputVariables, typeParser_);
+  auto transportKind = toVeloxTransportKind(node->transportType, *queryCtx_);
   if (node->orderingScheme) {
     std::vector<core::FieldAccessTypedExprPtr> sortingKeys;
     std::vector<core::SortOrder> sortingOrders;
@@ -2965,10 +2971,14 @@ core::PlanNodePtr VeloxInteractiveQueryPlanConverter::toVeloxQueryPlan(
         rowType,
         sortingKeys,
         sortingOrders,
-        toVeloxSerdeKind(node->encoding));
+        toVeloxSerdeKind(node->encoding),
+        std::move(transportKind));
   }
   return std::make_shared<core::ExchangeNode>(
-      node->id, rowType, toVeloxSerdeKind(node->encoding));
+      node->id,
+      rowType,
+      toVeloxSerdeKind(node->encoding),
+      std::move(transportKind));
 }
 
 connector::CommitStrategy
@@ -3106,12 +3116,18 @@ core::PlanNodePtr VeloxBatchQueryPlanConverter::toVeloxQueryPlan(
     const std::shared_ptr<const protocol::RemoteSourceNode>& node,
     const std::shared_ptr<protocol::TableWriteInfo>& /* tableWriteInfo */,
     const protocol::TaskId& taskId) {
-  planFragment_->inputTransportTypes[node->id] =
-      toVeloxTransportType(node->transportType);
   auto rowType = toRowType(node->outputVariables, typeParser_);
+  // The coordinator's transport annotation does not apply to the batch path: a
+  // partitioned read becomes a MaterializedExchangeNode or a ShuffleReadNode,
+  // neither of which is an ExchangeNode, and the broadcast read below always
+  // uses the in-memory transport.
   // Broadcast exchange source.
   if (node->exchangeType == protocol::ExchangeNodeType::REPLICATE) {
-    return std::make_shared<core::ExchangeNode>(node->id, rowType, "Presto");
+    return std::make_shared<core::ExchangeNode>(
+        node->id,
+        rowType,
+        "Presto",
+        std::string{core::TransportKind::kInMemory});
   }
   // Partitioned shuffle exchange source.
   // Use MaterializedExchangeNode when batch exchange I/O is enabled, unless the

@@ -27,6 +27,8 @@
 #include "presto_cpp/main/types/tests/TestUtils.h"
 #include "velox/connectors/hive/TableHandle.h"
 #include "velox/core/PlanFragment.h"
+#include "velox/exec/ExchangeTransportRegistry.h"
+#include "velox/exec/OutputTransportRegistry.h"
 #include "velox/exec/tests/utils/TempDirectoryPath.h"
 
 using namespace facebook::presto;
@@ -79,6 +81,8 @@ std::shared_ptr<const core::PlanNode> assertToBatchVeloxQueryPlan(
           prestoPlan, nullptr, "20201107_130540_00011_wrpkw.1.2.3")
       .planNode;
 }
+
+// Returns the first ExchangeNode in 'node's subtree, or nullptr.
 const core::ExchangeNode* findExchangeNode(
     const std::shared_ptr<const core::PlanNode>& node) {
   if (auto* exchange = dynamic_cast<const core::ExchangeNode*>(node.get())) {
@@ -92,17 +96,68 @@ const core::ExchangeNode* findExchangeNode(
   return nullptr;
 }
 
-// Returns the transport type annotated for 'nodeId' in 'transportTypes', or
-// TransportKind::kHttp when the node is absent, matching PlanFragment's
-// "a node absent from the map uses kHttp" contract.
-std::string_view transportTypeOrDefault(
-    const folly::F14FastMap<core::PlanNodeId, std::string>& transportTypes,
-    const core::PlanNodeId& nodeId) {
-  const auto it = transportTypes.find(nodeId);
-  return it == transportTypes.end() ? core::TransportKind::kHttp
-                                    : std::string_view{it->second};
+// Aliases the built-in in-memory transport entries under the UCX key for the
+// guard's lifetime. 'exchange' and 'output' select which of the two registries
+// gets the alias, so a test can also build the half-registered state the
+// transport gate must reject. The gate only asks whether an entry exists, so
+// aliasing exercises UCX selection without cuDF, a UCX build, or a GPU.
+class ScopedUcxTransportRegistration {
+ public:
+  ScopedUcxTransportRegistration(bool exchange, bool output)
+      : exchange_(exchange), output_(output) {
+    const auto inMemory = std::string{core::TransportKind::kInMemory};
+    if (exchange_) {
+      auto entry = exec::ExchangeTransportRegistry::tryGet(inMemory);
+      VELOX_CHECK_NOT_NULL(entry, "No built-in in-memory exchange transport");
+      exec::ExchangeTransportRegistry::global().insert(
+          ucx_, std::move(entry), /*overwrite=*/true);
+    }
+    if (output_) {
+      auto entry = exec::OutputTransportRegistry::tryGet(inMemory);
+      VELOX_CHECK_NOT_NULL(entry, "No built-in in-memory output transport");
+      exec::OutputTransportRegistry::global().insert(
+          ucx_, std::move(entry), /*overwrite=*/true);
+    }
+  }
+
+  ~ScopedUcxTransportRegistration() {
+    if (exchange_) {
+      exec::ExchangeTransportRegistry::global().erase(ucx_);
+    }
+    if (output_) {
+      exec::OutputTransportRegistry::global().erase(ucx_);
+    }
+  }
+
+ private:
+  const std::string ucx_{core::TransportKind::kUcx};
+  const bool exchange_;
+  const bool output_;
+};
+
+// Converts already-parsed fragment JSON, so a test can set the transport
+// annotations a coordinator would send before conversion. 'pool' outlives the
+// returned fragment, whose nodes may hold vectors allocated from it.
+core::PlanFragment convertFragment(const json& j, memory::MemoryPool* pool) {
+  protocol::PlanFragment prestoPlan = j;
+  auto queryCtx = core::QueryCtx::create();
+  VeloxInteractiveQueryPlanConverter converter(queryCtx.get(), pool);
+  return converter.toVeloxQueryPlan(
+      prestoPlan, nullptr, "20201107_130540_00011_wrpkw.1.2.3");
 }
 
+// Parses FinalAgg.json -- a fragment with a PartitionedOutputNode root and a
+// remote source beneath it, so one fixture covers both sides -- and sets both
+// transport annotations to 'transportType', or leaves them absent when nullopt.
+json finalAggWithTransportType(
+    const std::optional<std::string>& transportType) {
+  json j = json::parse(slurp(test::utils::getDataPath("FinalAgg.json")));
+  if (transportType.has_value()) {
+    j["outputTransportType"] = transportType.value();
+    j["root"]["source"]["sources"][0]["transportType"] = transportType.value();
+  }
+  return j;
+}
 } // namespace
 
 class PlanConverterTest : public ::testing::Test {
@@ -330,89 +385,61 @@ TEST_F(PlanConverterTest, batchPlanConversionExchangeWrite) {
   ASSERT_NE(materializedExchangeNode, nullptr);
 }
 
-TEST_F(PlanConverterTest, transportTypeAbsentDefaultsToHttp) {
-  std::string fragment = slurp(test::utils::getDataPath("FinalAgg.json"));
-  json j = json::parse(fragment);
-
-  ASSERT_FALSE(j.count("outputTransportType"));
-  ASSERT_FALSE(j["root"]["source"]["sources"][0].count("transportType"));
-
-  protocol::PlanFragment prestoPlan = j;
+TEST_F(PlanConverterTest, remoteTransportAbsentUsesInMemory) {
+  // An older coordinator sends no annotation at all.
   auto pool = memory::deprecatedAddDefaultLeafMemoryPool();
-  auto queryCtx = core::QueryCtx::create();
-  VeloxInteractiveQueryPlanConverter converter(queryCtx.get(), pool.get());
-  auto veloxFragment = converter.toVeloxQueryPlan(
-      prestoPlan, nullptr, "20201107_130540_00011_wrpkw.1.2.3");
+  auto fragment =
+      convertFragment(finalAggWithTransportType(std::nullopt), pool.get());
 
-  auto* partitionedOutput = dynamic_cast<const core::PartitionedOutputNode*>(
-      veloxFragment.planNode.get());
-  ASSERT_NE(partitionedOutput, nullptr);
-  ASSERT_EQ(
-      transportTypeOrDefault(
-          veloxFragment.outputTransportTypes, partitionedOutput->id()),
-      core::TransportKind::kHttp);
-
-  auto* exchange = findExchangeNode(veloxFragment.planNode);
+  const auto* exchange = findExchangeNode(fragment.planNode);
   ASSERT_NE(exchange, nullptr);
-  ASSERT_EQ(
-      transportTypeOrDefault(veloxFragment.inputTransportTypes, exchange->id()),
-      core::TransportKind::kHttp);
+  EXPECT_EQ(exchange->transportKind(), core::TransportKind::kInMemory);
 }
 
-TEST_F(PlanConverterTest, transportTypeAny) {
-  std::string fragment = slurp(test::utils::getDataPath("FinalAgg.json"));
-  json j = json::parse(fragment);
-
-  j["outputTransportType"] = "ANY";
-  j["root"]["source"]["sources"][0]["transportType"] = "ANY";
-
-  protocol::PlanFragment prestoPlan = j;
+TEST_F(PlanConverterTest, remoteTransportHttpUsesInMemory) {
   auto pool = memory::deprecatedAddDefaultLeafMemoryPool();
-  auto queryCtx = core::QueryCtx::create();
-  VeloxInteractiveQueryPlanConverter converter(queryCtx.get(), pool.get());
-  auto veloxFragment = converter.toVeloxQueryPlan(
-      prestoPlan, nullptr, "20201107_130540_00011_wrpkw.1.2.3");
+  auto fragment =
+      convertFragment(finalAggWithTransportType("HTTP"), pool.get());
 
-  auto* partitionedOutput = dynamic_cast<const core::PartitionedOutputNode*>(
-      veloxFragment.planNode.get());
-  ASSERT_NE(partitionedOutput, nullptr);
-  ASSERT_EQ(
-      transportTypeOrDefault(
-          veloxFragment.outputTransportTypes, partitionedOutput->id()),
-      core::TransportKind::kUcx);
-
-  auto* exchange = findExchangeNode(veloxFragment.planNode);
+  const auto* exchange = findExchangeNode(fragment.planNode);
   ASSERT_NE(exchange, nullptr);
-  ASSERT_EQ(
-      transportTypeOrDefault(veloxFragment.inputTransportTypes, exchange->id()),
-      core::TransportKind::kUcx);
+  EXPECT_EQ(exchange->transportKind(), core::TransportKind::kInMemory);
 }
 
-TEST_F(PlanConverterTest, transportTypeHttp) {
-  std::string fragment = slurp(test::utils::getDataPath("FinalAgg.json"));
-  json j = json::parse(fragment);
-
-  j["outputTransportType"] = "HTTP";
-  j["root"]["source"]["sources"][0]["transportType"] = "HTTP";
-
-  protocol::PlanFragment prestoPlan = j;
+TEST_F(PlanConverterTest, remoteTransportAnyWithoutUcxUsesInMemory) {
+  // The coordinator annotates every worker-to-worker exchange with ANY
+  // regardless of what this worker registered. Without this downgrade the node
+  // would name a transport that no registry resolves, and Task and
+  // LocalPlanner would fail the query.
   auto pool = memory::deprecatedAddDefaultLeafMemoryPool();
-  auto queryCtx = core::QueryCtx::create();
-  VeloxInteractiveQueryPlanConverter converter(queryCtx.get(), pool.get());
-  auto veloxFragment = converter.toVeloxQueryPlan(
-      prestoPlan, nullptr, "20201107_130540_00011_wrpkw.1.2.3");
+  auto fragment = convertFragment(finalAggWithTransportType("ANY"), pool.get());
 
-  auto* partitionedOutput = dynamic_cast<const core::PartitionedOutputNode*>(
-      veloxFragment.planNode.get());
-  ASSERT_NE(partitionedOutput, nullptr);
-  ASSERT_EQ(
-      transportTypeOrDefault(
-          veloxFragment.outputTransportTypes, partitionedOutput->id()),
-      core::TransportKind::kHttp);
-
-  auto* exchange = findExchangeNode(veloxFragment.planNode);
+  const auto* exchange = findExchangeNode(fragment.planNode);
   ASSERT_NE(exchange, nullptr);
-  ASSERT_EQ(
-      transportTypeOrDefault(veloxFragment.inputTransportTypes, exchange->id()),
-      core::TransportKind::kHttp);
+  EXPECT_EQ(exchange->transportKind(), core::TransportKind::kInMemory);
+}
+
+TEST_F(PlanConverterTest, remoteTransportAnyWithUcxSelectsUcx) {
+  ScopedUcxTransportRegistration ucxRegistered{/*exchange=*/true,
+                                               /*output=*/true};
+  auto pool = memory::deprecatedAddDefaultLeafMemoryPool();
+  auto fragment = convertFragment(finalAggWithTransportType("ANY"), pool.get());
+
+  const auto* exchange = findExchangeNode(fragment.planNode);
+  ASSERT_NE(exchange, nullptr);
+  EXPECT_EQ(exchange->transportKind(), core::TransportKind::kUcx);
+}
+
+TEST_F(PlanConverterTest, remoteTransportAnyWithHalfRegisteredUcxUsesInMemory) {
+  // Both registries must have the transport: the send and receive sides of a
+  // shuffle are separate tasks, and a worker that can receive over UCX but not
+  // send over it cannot participate.
+  ScopedUcxTransportRegistration exchangeOnly{/*exchange=*/true,
+                                              /*output=*/false};
+  auto pool = memory::deprecatedAddDefaultLeafMemoryPool();
+  auto fragment = convertFragment(finalAggWithTransportType("ANY"), pool.get());
+
+  const auto* exchange = findExchangeNode(fragment.planNode);
+  ASSERT_NE(exchange, nullptr);
+  EXPECT_EQ(exchange->transportKind(), core::TransportKind::kInMemory);
 }
