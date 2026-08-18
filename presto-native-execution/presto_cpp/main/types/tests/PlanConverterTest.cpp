@@ -96,6 +96,15 @@ const core::ExchangeNode* findExchangeNode(
   return nullptr;
 }
 
+// Returns the PartitionedOutputNode a converted fragment is rooted at, or
+// nullptr when 'node' is some other kind of root. The send side of an exchange
+// edge lives on that root, so its transport is what a consuming worker has to
+// agree with.
+const core::PartitionedOutputNode* asPartitionedOutputNode(
+    const std::shared_ptr<const core::PlanNode>& node) {
+  return dynamic_cast<const core::PartitionedOutputNode*>(node.get());
+}
+
 // Aliases the built-in in-memory transport entries under the UCX key for the
 // guard's lifetime. 'exchange' and 'output' select which of the two registries
 // gets the alias, so a test can also build the half-registered state the
@@ -396,6 +405,16 @@ TEST_F(PlanConverterTest, remoteTransportAbsentUsesInMemory) {
   EXPECT_EQ(exchange->transportKind(), core::TransportKind::kInMemory);
 }
 
+TEST_F(PlanConverterTest, outputTransportAbsentUsesInMemory) {
+  auto pool = memory::deprecatedAddDefaultLeafMemoryPool();
+  auto fragment =
+      convertFragment(finalAggWithTransportType(std::nullopt), pool.get());
+
+  const auto* output = asPartitionedOutputNode(fragment.planNode);
+  ASSERT_NE(output, nullptr);
+  EXPECT_EQ(output->transportKind(), core::TransportKind::kInMemory);
+}
+
 TEST_F(PlanConverterTest, remoteTransportHttpUsesInMemory) {
   auto pool = memory::deprecatedAddDefaultLeafMemoryPool();
   auto fragment =
@@ -404,6 +423,16 @@ TEST_F(PlanConverterTest, remoteTransportHttpUsesInMemory) {
   const auto* exchange = findExchangeNode(fragment.planNode);
   ASSERT_NE(exchange, nullptr);
   EXPECT_EQ(exchange->transportKind(), core::TransportKind::kInMemory);
+}
+
+TEST_F(PlanConverterTest, outputTransportHttpUsesInMemory) {
+  auto pool = memory::deprecatedAddDefaultLeafMemoryPool();
+  auto fragment =
+      convertFragment(finalAggWithTransportType("HTTP"), pool.get());
+
+  const auto* output = asPartitionedOutputNode(fragment.planNode);
+  ASSERT_NE(output, nullptr);
+  EXPECT_EQ(output->transportKind(), core::TransportKind::kInMemory);
 }
 
 TEST_F(PlanConverterTest, remoteTransportAnyWithoutUcxUsesInMemory) {
@@ -419,6 +448,15 @@ TEST_F(PlanConverterTest, remoteTransportAnyWithoutUcxUsesInMemory) {
   EXPECT_EQ(exchange->transportKind(), core::TransportKind::kInMemory);
 }
 
+TEST_F(PlanConverterTest, outputTransportAnyWithoutUcxUsesInMemory) {
+  auto pool = memory::deprecatedAddDefaultLeafMemoryPool();
+  auto fragment = convertFragment(finalAggWithTransportType("ANY"), pool.get());
+
+  const auto* output = asPartitionedOutputNode(fragment.planNode);
+  ASSERT_NE(output, nullptr);
+  EXPECT_EQ(output->transportKind(), core::TransportKind::kInMemory);
+}
+
 TEST_F(PlanConverterTest, remoteTransportAnyWithUcxSelectsUcx) {
   ScopedUcxTransportRegistration ucxRegistered{/*exchange=*/true,
                                                /*output=*/true};
@@ -428,6 +466,23 @@ TEST_F(PlanConverterTest, remoteTransportAnyWithUcxSelectsUcx) {
   const auto* exchange = findExchangeNode(fragment.planNode);
   ASSERT_NE(exchange, nullptr);
   EXPECT_EQ(exchange->transportKind(), core::TransportKind::kUcx);
+}
+
+TEST_F(PlanConverterTest, outputTransportAnyWithUcxSelectsUcx) {
+  // The send side must reach the same verdict as the receive side above. A
+  // PartitionedOutputNode left on the in-memory default while its consumer's
+  // ExchangeNode names UCX hangs the query: Task picks the output buffer
+  // manager from this node's transport, so UcxOutputQueueManager never learns
+  // about the task and the consumer's UCX sources wait for data that was
+  // written to the in-memory buffer instead.
+  ScopedUcxTransportRegistration ucxRegistered{/*exchange=*/true,
+                                               /*output=*/true};
+  auto pool = memory::deprecatedAddDefaultLeafMemoryPool();
+  auto fragment = convertFragment(finalAggWithTransportType("ANY"), pool.get());
+
+  const auto* output = asPartitionedOutputNode(fragment.planNode);
+  ASSERT_NE(output, nullptr);
+  EXPECT_EQ(output->transportKind(), core::TransportKind::kUcx);
 }
 
 TEST_F(PlanConverterTest, remoteTransportAnyWithHalfRegisteredUcxUsesInMemory) {
@@ -442,4 +497,15 @@ TEST_F(PlanConverterTest, remoteTransportAnyWithHalfRegisteredUcxUsesInMemory) {
   const auto* exchange = findExchangeNode(fragment.planNode);
   ASSERT_NE(exchange, nullptr);
   EXPECT_EQ(exchange->transportKind(), core::TransportKind::kInMemory);
+}
+
+TEST_F(PlanConverterTest, outputTransportAnyWithHalfRegisteredUcxUsesInMemory) {
+  ScopedUcxTransportRegistration exchangeOnly{/*exchange=*/true,
+                                              /*output=*/false};
+  auto pool = memory::deprecatedAddDefaultLeafMemoryPool();
+  auto fragment = convertFragment(finalAggWithTransportType("ANY"), pool.get());
+
+  const auto* output = asPartitionedOutputNode(fragment.planNode);
+  ASSERT_NE(output, nullptr);
+  EXPECT_EQ(output->transportKind(), core::TransportKind::kInMemory);
 }

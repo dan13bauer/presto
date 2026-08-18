@@ -2803,6 +2803,14 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
   auto outputType = toRowType(partitioningScheme.outputLayout, typeParser_);
   const auto partitionedOutputNodeId =
       toPartitionedOutputNodeId(fragment.root->id);
+  // Resolved with the same gate the consuming stage applies to its own
+  // ExchangeNode annotation. Both ends of an exchange edge must name the same
+  // transport: Task::createDriverFactoriesLocked() selects the output buffer
+  // manager from this node and the exchange client from the consumer's node, so
+  // a mismatch leaves the producer writing to one transport's buffers while the
+  // consumer waits on another's -- a hang, not an error.
+  const auto outputTransportKind =
+      toVeloxTransportKind(fragment.outputTransportType, *queryCtx_);
 
   if (auto systemPartitioningHandle =
           std::dynamic_pointer_cast<protocol::SystemPartitioningHandle>(
@@ -2818,6 +2826,7 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
             partitionedOutputNodeId,
             outputType,
             toVeloxSerdeKind(partitioningScheme.encoding),
+            outputTransportKind,
             sourceNode);
         return planFragment;
       case protocol::SystemPartitioning::FIXED: {
@@ -2832,6 +2841,7 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
                   partitionedOutputNodeId,
                   outputType,
                   toVeloxSerdeKind(partitioningScheme.encoding),
+                  outputTransportKind,
                   sourceNode);
               return planFragment;
             }
@@ -2845,6 +2855,7 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
                     std::make_shared<RoundRobinPartitionFunctionSpec>(),
                     outputType,
                     toVeloxSerdeKind(partitioningScheme.encoding),
+                    outputTransportKind,
                     sourceNode);
             return planFragment;
           }
@@ -2858,6 +2869,7 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
                   partitionedOutputNodeId,
                   outputType,
                   toVeloxSerdeKind(partitioningScheme.encoding),
+                  outputTransportKind,
                   sourceNode);
               return planFragment;
             }
@@ -2872,6 +2884,7 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
                         inputType, keyChannels, constValues),
                     outputType,
                     toVeloxSerdeKind(partitioningScheme.encoding),
+                    outputTransportKind,
                     sourceNode);
             return planFragment;
           }
@@ -2881,6 +2894,7 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
                 1,
                 outputType,
                 toVeloxSerdeKind(partitioningScheme.encoding),
+                outputTransportKind,
                 sourceNode);
             return planFragment;
           }
@@ -2900,6 +2914,7 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
             partitionedOutputNodeId,
             std::move(outputType),
             toVeloxSerdeKind(partitioningScheme.encoding),
+            outputTransportKind,
             std::move(sourceNode));
         return planFragment;
       }
@@ -2919,6 +2934,7 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
         partitionedOutputNodeId,
         outputType,
         toVeloxSerdeKind(partitioningScheme.encoding),
+        outputTransportKind,
         sourceNode);
     return planFragment;
   }
@@ -2935,6 +2951,7 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
       std::shared_ptr(std::move(spec)),
       toRowType(partitioningScheme.outputLayout, typeParser_),
       toVeloxSerdeKind(partitioningScheme.encoding),
+      outputTransportKind,
       sourceNode);
   return planFragment;
 }
@@ -2943,6 +2960,10 @@ core::PlanNodePtr VeloxQueryPlanConverterBase::toVeloxQueryPlan(
     const std::shared_ptr<const protocol::OutputNode>& node,
     const std::shared_ptr<protocol::TableWriteInfo>& tableWriteInfo,
     const protocol::TaskId& taskId) {
+  // Keeps the in-memory default rather than resolving the fragment's
+  // annotation: an OutputNode root is the query's final stage, whose results
+  // the coordinator itself fetches over HTTP. The coordinator annotates any
+  // edge it terminates as HTTP, so resolving would return in-memory anyway.
   return core::PartitionedOutputNode::single(
       node->id,
       toRowType(node->outputVariables, typeParser_),
