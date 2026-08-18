@@ -520,13 +520,12 @@ TEST_F(PlanConverterTest, remoteTransportAnyWithHalfRegisteredUcxUsesInMemory) {
   EXPECT_EQ(exchange->transportKind(), core::TransportKind::kInMemory);
 }
 
-// The three tests below reach the PartitionedOutputNode factories that
-// single() -- the only one the unmodified fixtures hit -- does not. Each
-// factory is a separate call site, and each has a backward-compatible overload
-// without a transport that defaults to in-memory, so dropping or misplacing the
-// transport argument at one of them still compiles and silently produces an
-// in-memory node. That reads as a hang at run time, not as an error, so every
-// factory needs its own assertion.
+// The tests below reach the PartitionedOutputNode call sites that the SINGLE
+// partitioning does not. Each site is a separate call, and each has a
+// backward-compatible overload without a transport that defaults to in-memory,
+// so dropping or misplacing the transport argument at one of them still
+// compiles and silently produces an in-memory node. That reads as a hang at run
+// time, not as an error, so every site needs its own assertion.
 TEST_F(PlanConverterTest, outputTransportUcxReachesHashPartitionedFactory) {
   // ScanAgg.json is already FIXED/HASH, but ships one bucket and so takes the
   // numPartitions == 1 early return into single(). Two buckets fall through to
@@ -542,6 +541,63 @@ TEST_F(PlanConverterTest, outputTransportUcxReachesHashPartitionedFactory) {
   ASSERT_NE(output, nullptr);
   EXPECT_TRUE(output->isPartitioned());
   EXPECT_EQ(output->numPartitions(), 2);
+  EXPECT_EQ(output->transportKind(), core::TransportKind::kUcx);
+}
+
+TEST_F(
+    PlanConverterTest,
+    outputTransportUcxReachesRoundRobinPartitionedFactory) {
+  ScopedUcxTransportRegistration ucxRegistered{/*exchange=*/true,
+                                               /*output=*/true};
+  auto pool = memory::deprecatedAddDefaultLeafMemoryPool();
+  auto fragment = convertFragment(
+      fragmentWithOutputPartitioning(
+          "FinalAgg.json", "FIXED", "ROUND_ROBIN", {0, 1}),
+      pool.get());
+
+  const auto* output = asPartitionedOutputNode(fragment.planNode);
+  ASSERT_NE(output, nullptr);
+  EXPECT_EQ(output->numPartitions(), 2);
+  // Distinguishes this constructor from the hash-partitioned one above, which
+  // is otherwise identical in shape.
+  EXPECT_EQ(output->partitionFunctionSpec().toString(), "ROUND ROBIN");
+  EXPECT_EQ(output->transportKind(), core::TransportKind::kUcx);
+}
+
+// The next two reach the numPartitions == 1 early returns under FIXED. Both
+// call single(), which always yields kPartitioned with one partition and a
+// gather spec, so the resulting node is indistinguishable from the one the
+// SINGLE partitioning produces -- only the input fragment says which branch
+// ran. What ties each test to its branch is that removing the transport
+// argument from that branch alone fails that test alone.
+TEST_F(PlanConverterTest, outputTransportUcxReachesRoundRobinSingleFactory) {
+  ScopedUcxTransportRegistration ucxRegistered{/*exchange=*/true,
+                                               /*output=*/true};
+  auto pool = memory::deprecatedAddDefaultLeafMemoryPool();
+  auto fragment = convertFragment(
+      fragmentWithOutputPartitioning(
+          "FinalAgg.json", "FIXED", "ROUND_ROBIN", {0}),
+      pool.get());
+
+  const auto* output = asPartitionedOutputNode(fragment.planNode);
+  ASSERT_NE(output, nullptr);
+  EXPECT_EQ(output->numPartitions(), 1);
+  EXPECT_EQ(output->transportKind(), core::TransportKind::kUcx);
+}
+
+TEST_F(PlanConverterTest, outputTransportUcxReachesHashSingleFactory) {
+  // ScanAgg.json ships FIXED/HASH with one bucket, so this is the fixture as it
+  // stands -- the partitioning is restated only to make the branch explicit.
+  ScopedUcxTransportRegistration ucxRegistered{/*exchange=*/true,
+                                               /*output=*/true};
+  auto pool = memory::deprecatedAddDefaultLeafMemoryPool();
+  auto fragment = convertFragment(
+      fragmentWithOutputPartitioning("ScanAgg.json", "FIXED", "HASH", {0}),
+      pool.get());
+
+  const auto* output = asPartitionedOutputNode(fragment.planNode);
+  ASSERT_NE(output, nullptr);
+  EXPECT_EQ(output->numPartitions(), 1);
   EXPECT_EQ(output->transportKind(), core::TransportKind::kUcx);
 }
 
