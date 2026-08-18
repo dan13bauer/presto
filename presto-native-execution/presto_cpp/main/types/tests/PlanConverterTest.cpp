@@ -167,6 +167,27 @@ json finalAggWithTransportType(
   }
   return j;
 }
+
+// Rewrites 'fileName's output partitioning and annotates the output transport
+// ANY. The converter picks which PartitionedOutputNode factory to call from the
+// (partitioning, function) pair and, for FIXED, from whether
+// 'bucketToPartition' yields more than one partition -- so rewriting these is
+// how a test reaches a specific factory. The fixtures ship a single bucket, and
+// therefore only ever reach single().
+json fragmentWithOutputPartitioning(
+    const std::string& fileName,
+    const std::string& partitioning,
+    const std::string& function,
+    const std::vector<int32_t>& bucketToPartition) {
+  json j = json::parse(slurp(test::utils::getDataPath(fileName)));
+  j["outputTransportType"] = "ANY";
+  auto& handle =
+      j["partitioningScheme"]["partitioning"]["handle"]["connectorHandle"];
+  handle["partitioning"] = partitioning;
+  handle["function"] = function;
+  j["partitioningScheme"]["bucketToPartition"] = bucketToPartition;
+  return j;
+}
 } // namespace
 
 class PlanConverterTest : public ::testing::Test {
@@ -497,6 +518,63 @@ TEST_F(PlanConverterTest, remoteTransportAnyWithHalfRegisteredUcxUsesInMemory) {
   const auto* exchange = findExchangeNode(fragment.planNode);
   ASSERT_NE(exchange, nullptr);
   EXPECT_EQ(exchange->transportKind(), core::TransportKind::kInMemory);
+}
+
+// The three tests below reach the PartitionedOutputNode factories that
+// single() -- the only one the unmodified fixtures hit -- does not. Each
+// factory is a separate call site, and each has a backward-compatible overload
+// without a transport that defaults to in-memory, so dropping or misplacing the
+// transport argument at one of them still compiles and silently produces an
+// in-memory node. That reads as a hang at run time, not as an error, so every
+// factory needs its own assertion.
+TEST_F(PlanConverterTest, outputTransportUcxReachesHashPartitionedFactory) {
+  // ScanAgg.json is already FIXED/HASH, but ships one bucket and so takes the
+  // numPartitions == 1 early return into single(). Two buckets fall through to
+  // the multi-partition constructor.
+  ScopedUcxTransportRegistration ucxRegistered{/*exchange=*/true,
+                                               /*output=*/true};
+  auto pool = memory::deprecatedAddDefaultLeafMemoryPool();
+  auto fragment = convertFragment(
+      fragmentWithOutputPartitioning("ScanAgg.json", "FIXED", "HASH", {0, 1}),
+      pool.get());
+
+  const auto* output = asPartitionedOutputNode(fragment.planNode);
+  ASSERT_NE(output, nullptr);
+  EXPECT_TRUE(output->isPartitioned());
+  EXPECT_EQ(output->numPartitions(), 2);
+  EXPECT_EQ(output->transportKind(), core::TransportKind::kUcx);
+}
+
+TEST_F(PlanConverterTest, outputTransportUcxReachesBroadcastFactory) {
+  ScopedUcxTransportRegistration ucxRegistered{/*exchange=*/true,
+                                               /*output=*/true};
+  auto pool = memory::deprecatedAddDefaultLeafMemoryPool();
+  auto fragment = convertFragment(
+      fragmentWithOutputPartitioning(
+          "FinalAgg.json", "FIXED", "BROADCAST", {0}),
+      pool.get());
+
+  const auto* output = asPartitionedOutputNode(fragment.planNode);
+  ASSERT_NE(output, nullptr);
+  EXPECT_TRUE(output->isBroadcast());
+  EXPECT_EQ(output->transportKind(), core::TransportKind::kUcx);
+}
+
+TEST_F(PlanConverterTest, outputTransportUcxReachesArbitraryFactory) {
+  // SCALED requires ROUND_ROBIN, and reaches arbitrary() without consulting
+  // bucketToPartition at all.
+  ScopedUcxTransportRegistration ucxRegistered{/*exchange=*/true,
+                                               /*output=*/true};
+  auto pool = memory::deprecatedAddDefaultLeafMemoryPool();
+  auto fragment = convertFragment(
+      fragmentWithOutputPartitioning(
+          "FinalAgg.json", "SCALED", "ROUND_ROBIN", {0}),
+      pool.get());
+
+  const auto* output = asPartitionedOutputNode(fragment.planNode);
+  ASSERT_NE(output, nullptr);
+  EXPECT_TRUE(output->isArbitrary());
+  EXPECT_EQ(output->transportKind(), core::TransportKind::kUcx);
 }
 
 TEST_F(PlanConverterTest, outputTransportAnyWithHalfRegisteredUcxUsesInMemory) {
