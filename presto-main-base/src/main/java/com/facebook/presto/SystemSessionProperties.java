@@ -426,6 +426,7 @@ public final class SystemSessionProperties
     public static final String NATIVE_ENFORCE_JOIN_BUILD_INPUT_PARTITION = "native_enforce_join_build_input_partition";
     public static final String NATIVE_EXECUTION_SCALE_WRITER_THREADS_ENABLED = "native_execution_scale_writer_threads_enabled";
     public static final String NATIVE_EXCHANGE_MATERIALIZATION_ENABLED = "native_exchange_materialization_enabled";
+    public static final String NATIVE_CUDF_EXCHANGE_ENABLED = "native_cudf_exchange_enabled";
     public static final String NATIVE_DYNAMIC_FILTER_PUSHDOWN_ENABLED = "native_dynamic_filter_pushdown_enabled";
     public static final String TRY_FUNCTION_CATCHABLE_ERRORS = "try_function_catchable_errors";
     public static final String PUSH_FILTER_THROUGH_SELECTING_AGGREGATION = "push_filter_through_selecting_aggregation";
@@ -2327,6 +2328,12 @@ public final class SystemSessionProperties
                         "Native Execution only. Enable materialized exchange operators in Velox (MaterializedOutput/MaterializedExchange). When false, uses PartitionAndSerialize + ShuffleWrite.",
                         true,
                         false),
+                booleanProperty(NATIVE_CUDF_EXCHANGE_ENABLED,
+                        "Native Execution only. Allow worker-to-worker exchanges to use the cuDF UCX transport (Velox 'cudf.exchange'). " +
+                                "The coordinator only annotates fragments with the UCX transport when this is enabled; the workers must also " +
+                                "have cudf.exchange enabled, otherwise the query fails because the transport is not registered.",
+                        false,
+                        false),
                 booleanProperty(NATIVE_DYNAMIC_FILTER_PUSHDOWN_ENABLED,
                         "Native Execution only. Enable Velox built-in hash probe dynamic filter pushdown to upstream table scans",
                         true,
@@ -4079,6 +4086,11 @@ public final class SystemSessionProperties
     public static boolean isNativeExchangeMaterializationEnabled(Session session)
     {
         return session.getSystemProperty(NATIVE_EXCHANGE_MATERIALIZATION_ENABLED, Boolean.class);
+    }
+
+    public static boolean isNativeCudfExchangeEnabled(Session session)
+    {
+        return session.getSystemProperty(NATIVE_CUDF_EXCHANGE_ENABLED, Boolean.class);
     }
 
     public static int getMaxSplitPreloadPerDriver(Session session)

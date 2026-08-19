@@ -58,6 +58,7 @@ import com.facebook.presto.sql.planner.plan.TableFunctionNode;
 import com.facebook.presto.sql.planner.plan.TableFunctionProcessorNode;
 import com.facebook.presto.sql.planner.plan.TransportType;
 import com.facebook.presto.sql.planner.sanity.PlanChecker;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -71,6 +72,7 @@ import java.util.Optional;
 import java.util.Set;
 
 import static com.facebook.presto.SystemSessionProperties.isForceSingleNodeOutput;
+import static com.facebook.presto.SystemSessionProperties.isNativeCudfExchangeEnabled;
 import static com.facebook.presto.SystemSessionProperties.isNativeExecutionEnabled;
 import static com.facebook.presto.SystemSessionProperties.isSingleNodeExecutionEnabled;
 import static com.facebook.presto.spi.StandardErrorCode.NOT_SUPPORTED;
@@ -383,18 +385,7 @@ public abstract class BasePlanFragmenter
 
         setDistributionForExchange(exchange.getType(), partitioningScheme, context);
 
-        // Use ANY (e.g. UCX) for worker-to-worker exchanges, but fall back to
-        // HTTP when a child fragment runs on the coordinator (which only speaks HTTP).
-        TransportType transportType = TransportType.HTTP;
-        boolean anyChildOnCoordinator = exchange.getSources().stream()
-                .anyMatch(PlannerUtils::containsCoordinatorOnlyNode);
-        if (!anyChildOnCoordinator) {
-            transportType = TransportType.ANY;
-        }
-        log.debug("[ANY_EXCHANGE] exchange=%s transport=%s partitioning=%s",
-                exchange.getId(),
-                transportType,
-                context.get().getPartitioningHandle());
+        TransportType transportType = remoteStreamingExchangeTransportType(session, exchange, context.get());
 
         ImmutableList.Builder<SubPlan> builder = ImmutableList.builder();
         for (int sourceIndex = 0; sourceIndex < exchange.getSources().size(); sourceIndex++) {
@@ -416,6 +407,28 @@ public abstract class BasePlanFragmenter
         List<SubPlan> children = builder.build();
         context.get().addChildren(children);
 
+        // A remote exchange edge is described by two plan nodes in two different fragments: the producer fragment's
+        // output transport and the consumer fragment's RemoteSourceNode transport. Each worker resolves its own end
+        // independently, so nothing downstream can cross-check them. The fragmenter is the only place that sees both
+        // ends, so assert here that they agree.
+        for (SubPlan child : children) {
+            verify(
+                    child.getFragment().getOutputTransportType() == transportType,
+                    "Exchange %s reads over %s but producer fragment %s writes over %s",
+                    exchange.getId(),
+                    transportType,
+                    child.getFragment().getId(),
+                    child.getFragment().getOutputTransportType());
+            // The producer fragment's distribution is only final once it has been built, so re-check what
+            // remoteStreamingExchangeTransportType() predicted from the unfragmented sources.
+            verify(
+                    transportType == TransportType.HTTP || !child.getFragment().getPartitioning().isCoordinatorOnly(),
+                    "Exchange %s uses %s but producer fragment %s runs on the coordinator, which only speaks HTTP",
+                    exchange.getId(),
+                    transportType,
+                    child.getFragment().getId());
+        }
+
         List<PlanFragmentId> childrenIds = children.stream()
                 .map(SubPlan::getFragment)
                 .map(PlanFragment::getId)
@@ -432,6 +445,40 @@ public abstract class BasePlanFragmenter
                 exchange.getType(),
                 exchange.getPartitioningScheme().getEncoding(),
                 transportType);
+    }
+
+    /**
+     * Picks the transport for one remote streaming exchange edge. The value is annotated on both ends of the edge:
+     * on the producer fragment's output and on the consumer's {@link RemoteSourceNode}.
+     * <p>
+     * A native worker resolves the transport named by the plan against the transports it has registered and fails the
+     * query when the transport is missing, rather than silently downgrading to HTTP. Per-query enablement therefore
+     * lives here, on the coordinator: {@code ANY} (the UCX transport) is only named when the query has the cuDF
+     * exchange enabled. Any edge that touches the coordinator stays on {@code HTTP} because the coordinator speaks
+     * only HTTP.
+     */
+    @VisibleForTesting
+    static TransportType remoteStreamingExchangeTransportType(Session session, ExchangeNode exchange, FragmentProperties consumerProperties)
+    {
+        if (!isNativeCudfExchangeEnabled(session)) {
+            // No worker is expected to have the UCX transport registered, so nothing may name it.
+            return TransportType.HTTP;
+        }
+
+        // Fall back to HTTP when either side of the edge touches the coordinator:
+        //  - a child (producer) fragment contains coordinator-only nodes, OR
+        //  - the current (consumer) fragment runs on the coordinator.
+        boolean producerOnCoordinator = exchange.getSources().stream()
+                .anyMatch(PlannerUtils::containsCoordinatorOnlyNode);
+        boolean consumerOnCoordinator = consumerProperties.hasCoordinatorOnlyDistribution();
+        TransportType transportType = producerOnCoordinator || consumerOnCoordinator ? TransportType.HTTP : TransportType.ANY;
+        log.debug("[ANY_EXCHANGE] exchange=%s transport=%s partitioning=%s producerOnCoord=%s consumerOnCoord=%s",
+                exchange.getId(),
+                transportType,
+                exchange.getPartitioningScheme().getPartitioning().getHandle(),
+                producerOnCoordinator,
+                consumerOnCoordinator);
+        return transportType;
     }
 
     protected void setDistributionForExchange(ExchangeNode.Type exchangeType, PartitioningScheme partitioningScheme, RewriteContext<FragmentProperties> context)
@@ -661,6 +708,11 @@ public abstract class BasePlanFragmenter
             partitioningHandle = Optional.of(COORDINATOR_DISTRIBUTION);
 
             return this;
+        }
+
+        public boolean hasCoordinatorOnlyDistribution()
+        {
+            return partitioningHandle.isPresent() && partitioningHandle.get().isCoordinatorOnly();
         }
 
         public FragmentProperties addPartitionedSource(PlanNodeId source)

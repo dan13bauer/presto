@@ -274,6 +274,15 @@ set(VELOX_GTEST_INCUDE_DIR "velox/third_party/googletest/googletest/include")
 set(VELOX_MONO_LIBRARY ON CACHE BOOL "Build Velox mono library")
 add_subdirectory(velox)
 
+# Velox declares VELOX_ENABLE_UCX_EXCHANGE while resolving cuDF, so its value is
+# only known after add_subdirectory(velox) above. Presto code that touches the
+# UCX transport must key on this definition and not on PRESTO_ENABLE_CUDF: cuDF
+# builds fine without UCX, in which case neither the ucxx targets nor the
+# ucx-exchange headers exist.
+if(VELOX_ENABLE_UCX_EXCHANGE)
+  add_compile_definitions(PRESTO_ENABLE_UCX_EXCHANGE)
+endif()
+
 if(PRESTO_ENABLE_TESTING)
   set(BUILD_TESTING ON) # some third-party dependency could have disabled this.
   include(CTest) # include after project() but before add_subdirectory()

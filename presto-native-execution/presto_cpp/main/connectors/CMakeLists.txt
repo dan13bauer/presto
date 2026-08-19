@@ -27,6 +27,11 @@ endif()
 
 if(PRESTO_ENABLE_CUDF)
   target_link_libraries(presto_connectors velox_cudf_hive_connector cudf::cudf)
+  # ucxx is only fetched when the UCX exchange is enabled, so the imported
+  # target does not exist in a cuDF-without-UCX build.
+  if(VELOX_ENABLE_UCX_EXCHANGE)
+    target_link_libraries(presto_connectors ucxx::ucxx)
+  endif()
 endif()
 
 target_link_libraries(presto_connectors presto_velox_expr_conversion velox)

@@ -78,6 +78,56 @@ std::shared_ptr<const core::PlanNode> assertToBatchVeloxQueryPlan(
           prestoPlan, nullptr, "20201107_130540_00011_wrpkw.1.2.3")
       .planNode;
 }
+
+json parseFragmentJson(const std::string& fileName) {
+  return json::parse(slurp(test::utils::getDataPath(fileName)));
+}
+
+// Converts an interactive plan fragment from already parsed JSON, so that a
+// test can annotate transport types on the fragment before conversion.
+core::PlanFragment toVeloxFragment(const json& fragmentJson) {
+  const protocol::PlanFragment prestoPlan = fragmentJson;
+  auto pool = memory::deprecatedAddDefaultLeafMemoryPool();
+  auto queryCtx = core::QueryCtx::create();
+  VeloxInteractiveQueryPlanConverter converter(queryCtx.get(), pool.get());
+  return converter.toVeloxQueryPlan(
+      prestoPlan, nullptr, "20201107_130540_00011_wrpkw.1.2.3");
+}
+
+// Annotates every RemoteSourceNode found in 'node' with 'transportType', the
+// way the coordinator annotates the input edges of a fragment.
+void annotateRemoteSources(json& node, const std::string& transportType) {
+  if (node.is_object()) {
+    const auto type = node.find("@type");
+    if (type != node.end() && type->is_string() &&
+        type->get<std::string>().find("RemoteSourceNode") !=
+            std::string::npos) {
+      node["transportType"] = transportType;
+    }
+    for (auto& element : node.items()) {
+      annotateRemoteSources(element.value(), transportType);
+    }
+  } else if (node.is_array()) {
+    for (auto& element : node) {
+      annotateRemoteSources(element, transportType);
+    }
+  }
+}
+
+// Returns the first ExchangeNode found in the plan rooted at 'node', or nullptr
+// when the plan has none.
+const core::ExchangeNode* findExchangeNode(const core::PlanNodePtr& node) {
+  if (const auto* exchange =
+          dynamic_cast<const core::ExchangeNode*>(node.get())) {
+    return exchange;
+  }
+  for (const auto& source : node->sources()) {
+    if (const auto* found = findExchangeNode(source)) {
+      return found;
+    }
+  }
+  return nullptr;
+}
 } // namespace
 
 class PlanConverterTest : public ::testing::Test {
@@ -182,6 +232,132 @@ TEST_F(PlanConverterTest, offsetLimit) {
   }
 
   ASSERT_TRUE(foundLimit);
+}
+
+// A coordinator that does not enable UCX for the query sends no transport
+// annotation at all. Both ends of the exchange edge then name the default
+// in-memory transport.
+TEST_F(PlanConverterTest, transportTypeAbsentDefaultsToInMemory) {
+  auto fragmentJson = parseFragmentJson("FinalAgg.json");
+  ASSERT_FALSE(fragmentJson.count("outputTransportType"));
+  ASSERT_FALSE(
+      fragmentJson["root"]["source"]["sources"][0].count("transportType"));
+
+  const auto fragment = toVeloxFragment(fragmentJson);
+
+  const auto* partitionedOutput =
+      dynamic_cast<const core::PartitionedOutputNode*>(fragment.planNode.get());
+  ASSERT_NE(partitionedOutput, nullptr);
+  ASSERT_EQ(partitionedOutput->transportKind(), core::TransportKind::kInMemory);
+
+  const auto* exchange = findExchangeNode(fragment.planNode);
+  ASSERT_NE(exchange, nullptr);
+  ASSERT_EQ(exchange->transportKind(), core::TransportKind::kInMemory);
+}
+
+// HTTP maps to the in-memory transport: the producer buffers its output in
+// memory and the consumer drains it over HTTP.
+TEST_F(PlanConverterTest, transportTypeHttp) {
+  auto fragmentJson = parseFragmentJson("FinalAgg.json");
+  fragmentJson["outputTransportType"] = "HTTP";
+  annotateRemoteSources(fragmentJson["root"], "HTTP");
+
+  const auto fragment = toVeloxFragment(fragmentJson);
+
+  const auto* partitionedOutput =
+      dynamic_cast<const core::PartitionedOutputNode*>(fragment.planNode.get());
+  ASSERT_NE(partitionedOutput, nullptr);
+  ASSERT_EQ(partitionedOutput->transportKind(), core::TransportKind::kInMemory);
+
+  const auto* exchange = findExchangeNode(fragment.planNode);
+  ASSERT_NE(exchange, nullptr);
+  ASSERT_EQ(exchange->transportKind(), core::TransportKind::kInMemory);
+}
+
+// ANY means the query may use the fastest transport the workers register, which
+// is UCX.
+TEST_F(PlanConverterTest, transportTypeAny) {
+  auto fragmentJson = parseFragmentJson("FinalAgg.json");
+  fragmentJson["outputTransportType"] = "ANY";
+  annotateRemoteSources(fragmentJson["root"], "ANY");
+
+  const auto fragment = toVeloxFragment(fragmentJson);
+
+  const auto* partitionedOutput =
+      dynamic_cast<const core::PartitionedOutputNode*>(fragment.planNode.get());
+  ASSERT_NE(partitionedOutput, nullptr);
+  ASSERT_EQ(partitionedOutput->transportKind(), core::TransportKind::kUcx);
+
+  const auto* exchange = findExchangeNode(fragment.planNode);
+  ASSERT_NE(exchange, nullptr);
+  ASSERT_EQ(exchange->transportKind(), core::TransportKind::kUcx);
+}
+
+// A sorted remote source becomes a MergeExchangeNode, which carries the
+// transport just like a plain ExchangeNode. The fragment's own output goes to
+// the coordinator, which speaks only HTTP, so that edge stays in-memory even
+// when the fragment is annotated ANY.
+TEST_F(PlanConverterTest, transportTypeMergeExchange) {
+  auto fragmentJson = parseFragmentJson("OffsetLimit.json");
+  fragmentJson["outputTransportType"] = "ANY";
+  annotateRemoteSources(fragmentJson["root"], "ANY");
+
+  const auto fragment = toVeloxFragment(fragmentJson);
+
+  const auto* partitionedOutput =
+      dynamic_cast<const core::PartitionedOutputNode*>(fragment.planNode.get());
+  ASSERT_NE(partitionedOutput, nullptr);
+  ASSERT_EQ(partitionedOutput->transportKind(), core::TransportKind::kInMemory);
+
+  const auto* exchange = findExchangeNode(fragment.planNode);
+  ASSERT_NE(exchange, nullptr);
+  ASSERT_NE(dynamic_cast<const core::MergeExchangeNode*>(exchange), nullptr);
+  ASSERT_EQ(exchange->transportKind(), core::TransportKind::kUcx);
+}
+
+// An exchange edge spans two fragments: the producer's PartitionedOutputNode
+// and the consumer's ExchangeNode. Velox resolves each end independently from
+// its own node, so the two must name the same transport. The coordinator is the
+// only component that sees both ends and therefore owns this invariant.
+TEST_F(PlanConverterTest, transportTypeEdgeAgreement) {
+  // Producer fragment of the edge.
+  auto producerJson = parseFragmentJson("ScanAgg.json");
+  producerJson["outputTransportType"] = "ANY";
+  const auto producerFragment = toVeloxFragment(producerJson);
+  const auto* partitionedOutput =
+      dynamic_cast<const core::PartitionedOutputNode*>(
+          producerFragment.planNode.get());
+  ASSERT_NE(partitionedOutput, nullptr);
+
+  // Consumer fragment of the same edge, annotated with the same value.
+  auto consumerJson = parseFragmentJson("FinalAgg.json");
+  annotateRemoteSources(consumerJson["root"], "ANY");
+  const auto consumerFragment = toVeloxFragment(consumerJson);
+  const auto* exchange = findExchangeNode(consumerFragment.planNode);
+  ASSERT_NE(exchange, nullptr);
+
+  ASSERT_EQ(partitionedOutput->transportKind(), exchange->transportKind());
+  ASSERT_EQ(partitionedOutput->transportKind(), core::TransportKind::kUcx);
+
+  // The same edge annotated HTTP on both ends agrees on in-memory.
+  auto httpProducerJson = parseFragmentJson("ScanAgg.json");
+  httpProducerJson["outputTransportType"] = "HTTP";
+  const auto httpProducerFragment = toVeloxFragment(httpProducerJson);
+  const auto* httpPartitionedOutput =
+      dynamic_cast<const core::PartitionedOutputNode*>(
+          httpProducerFragment.planNode.get());
+  ASSERT_NE(httpPartitionedOutput, nullptr);
+
+  auto httpConsumerJson = parseFragmentJson("FinalAgg.json");
+  annotateRemoteSources(httpConsumerJson["root"], "HTTP");
+  const auto httpConsumerFragment = toVeloxFragment(httpConsumerJson);
+  const auto* httpExchange = findExchangeNode(httpConsumerFragment.planNode);
+  ASSERT_NE(httpExchange, nullptr);
+
+  ASSERT_EQ(
+      httpPartitionedOutput->transportKind(), httpExchange->transportKind());
+  ASSERT_EQ(
+      httpPartitionedOutput->transportKind(), core::TransportKind::kInMemory);
 }
 
 // IndexSourceNode is converted to a TableScanNode with the same output type

@@ -389,6 +389,31 @@ std::string toVeloxSerdeKind(protocol::ExchangeEncoding encoding) {
   VELOX_UNSUPPORTED("Unsupported encoding: {}.", fmt::underlying(encoding));
 }
 
+// Maps the coordinator's per-edge transport annotation onto the Velox transport
+// identifier the plan node names. The coordinator sends ANY when the query is
+// allowed to use the fastest transport the workers register, which is UCX. HTTP
+// and a missing annotation both mean the default in-memory output buffering
+// that the consumer drains over HTTP.
+//
+// Velox fails the query when a plan node names a transport that is not
+// registered on the worker, so the coordinator must only send ANY when UCX is
+// actually enabled for the query. That gating lives in the Java
+// BasePlanFragmenter.
+std::string toVeloxTransportType(
+    const std::shared_ptr<protocol::TransportType>& transportType) {
+  if (transportType == nullptr) {
+    return std::string{core::TransportKind::kInMemory};
+  }
+  switch (*transportType) {
+    case protocol::TransportType::HTTP:
+      return std::string{core::TransportKind::kInMemory};
+    case protocol::TransportType::ANY:
+      return std::string{core::TransportKind::kUcx};
+  }
+  VELOX_UNSUPPORTED(
+      "Unsupported transport type: {}", fmt::underlying(*transportType));
+}
+
 std::shared_ptr<core::LocalPartitionNode> buildLocalSystemPartitionNode(
     const std::shared_ptr<const protocol::ExchangeNode>& node,
     core::LocalPartitionNode::Type type,
@@ -2777,6 +2802,11 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
   auto outputType = toRowType(partitioningScheme.outputLayout, typeParser_);
   const auto partitionedOutputNodeId =
       toPartitionedOutputNodeId(fragment.root->id);
+  // The transport this fragment sends its results over. The coordinator
+  // annotates the same value on the consuming fragment's RemoteSourceNode, so
+  // both ends of the exchange edge resolve the same transport.
+  const auto outputTransportKind =
+      toVeloxTransportType(fragment.outputTransportType);
 
   if (auto systemPartitioningHandle =
           std::dynamic_pointer_cast<protocol::SystemPartitioningHandle>(
@@ -2792,6 +2822,7 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
             partitionedOutputNodeId,
             outputType,
             toVeloxSerdeKind(partitioningScheme.encoding),
+            outputTransportKind,
             sourceNode);
         return planFragment;
       case protocol::SystemPartitioning::FIXED: {
@@ -2806,6 +2837,7 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
                   partitionedOutputNodeId,
                   outputType,
                   toVeloxSerdeKind(partitioningScheme.encoding),
+                  outputTransportKind,
                   sourceNode);
               return planFragment;
             }
@@ -2819,6 +2851,7 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
                     std::make_shared<RoundRobinPartitionFunctionSpec>(),
                     outputType,
                     toVeloxSerdeKind(partitioningScheme.encoding),
+                    outputTransportKind,
                     sourceNode);
             return planFragment;
           }
@@ -2832,6 +2865,7 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
                   partitionedOutputNodeId,
                   outputType,
                   toVeloxSerdeKind(partitioningScheme.encoding),
+                  outputTransportKind,
                   sourceNode);
               return planFragment;
             }
@@ -2846,6 +2880,7 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
                         inputType, keyChannels, constValues),
                     outputType,
                     toVeloxSerdeKind(partitioningScheme.encoding),
+                    outputTransportKind,
                     sourceNode);
             return planFragment;
           }
@@ -2855,6 +2890,7 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
                 1,
                 outputType,
                 toVeloxSerdeKind(partitioningScheme.encoding),
+                outputTransportKind,
                 sourceNode);
             return planFragment;
           }
@@ -2874,6 +2910,7 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
             partitionedOutputNodeId,
             std::move(outputType),
             toVeloxSerdeKind(partitioningScheme.encoding),
+            outputTransportKind,
             std::move(sourceNode));
         return planFragment;
       }
@@ -2893,6 +2930,7 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
         partitionedOutputNodeId,
         outputType,
         toVeloxSerdeKind(partitioningScheme.encoding),
+        outputTransportKind,
         sourceNode);
     return planFragment;
   }
@@ -2909,6 +2947,7 @@ core::PlanFragment VeloxQueryPlanConverterBase::toVeloxQueryPlan(
       std::shared_ptr(std::move(spec)),
       toRowType(partitioningScheme.outputLayout, typeParser_),
       toVeloxSerdeKind(partitioningScheme.encoding),
+      outputTransportKind,
       sourceNode);
   return planFragment;
 }
@@ -2917,10 +2956,13 @@ core::PlanNodePtr VeloxQueryPlanConverterBase::toVeloxQueryPlan(
     const std::shared_ptr<const protocol::OutputNode>& node,
     const std::shared_ptr<protocol::TableWriteInfo>& tableWriteInfo,
     const protocol::TaskId& taskId) {
+  // The output stage's results are fetched by the coordinator, which speaks
+  // only HTTP, so this edge always uses the in-memory transport.
   return core::PartitionedOutputNode::single(
       node->id,
       toRowType(node->outputVariables, typeParser_),
       "Presto",
+      std::string{core::TransportKind::kInMemory},
       toVeloxQueryPlan(node->source, tableWriteInfo, taskId));
 }
 
@@ -2929,6 +2971,10 @@ core::PlanNodePtr VeloxInteractiveQueryPlanConverter::toVeloxQueryPlan(
     const std::shared_ptr<protocol::TableWriteInfo>& /*tableWriteInfo*/,
     const protocol::TaskId& taskId) {
   auto rowType = toRowType(node->outputVariables, typeParser_);
+  // The transport this fragment reads its input over. The coordinator annotates
+  // the same value on the producing fragment's output, so both ends of the
+  // exchange edge resolve the same transport.
+  auto inputTransportKind = toVeloxTransportType(node->transportType);
   if (node->orderingScheme) {
     std::vector<core::FieldAccessTypedExprPtr> sortingKeys;
     std::vector<core::SortOrder> sortingOrders;
@@ -2944,10 +2990,14 @@ core::PlanNodePtr VeloxInteractiveQueryPlanConverter::toVeloxQueryPlan(
         rowType,
         sortingKeys,
         sortingOrders,
-        toVeloxSerdeKind(node->encoding));
+        toVeloxSerdeKind(node->encoding),
+        std::move(inputTransportKind));
   }
   return std::make_shared<core::ExchangeNode>(
-      node->id, rowType, toVeloxSerdeKind(node->encoding));
+      node->id,
+      rowType,
+      toVeloxSerdeKind(node->encoding),
+      std::move(inputTransportKind));
 }
 
 connector::CommitStrategy
@@ -2986,11 +3036,14 @@ core::PlanFragment VeloxBatchQueryPlanConverter::toVeloxQueryPlan(
             "broadcast-write-gather",
             std::vector{partitionedOutputNode->sources()}));
 
+    // Batch broadcast results are written to storage by BroadcastWrite and read
+    // back from there, so this edge always uses the in-memory transport.
     planFragment.planNode = core::PartitionedOutputNode::broadcast(
         partitionedOutputNode->id(),
         1,
         broadcastWriteNode->outputType(),
         "Presto",
+        std::string{core::TransportKind::kInMemory},
         {broadcastWriteNode});
     return planFragment;
   }
@@ -3086,9 +3139,14 @@ core::PlanNodePtr VeloxBatchQueryPlanConverter::toVeloxQueryPlan(
     const std::shared_ptr<protocol::TableWriteInfo>& /* tableWriteInfo */,
     const protocol::TaskId& taskId) {
   auto rowType = toRowType(node->outputVariables, typeParser_);
-  // Broadcast exchange source.
+  // Broadcast exchange source. Batch broadcast data is read back from storage,
+  // so this edge always uses the in-memory transport.
   if (node->exchangeType == protocol::ExchangeNodeType::REPLICATE) {
-    return std::make_shared<core::ExchangeNode>(node->id, rowType, "Presto");
+    return std::make_shared<core::ExchangeNode>(
+        node->id,
+        rowType,
+        "Presto",
+        std::string{core::TransportKind::kInMemory});
   }
   // Partitioned shuffle exchange source.
   // Use MaterializedExchangeNode when batch exchange I/O is enabled, unless the
