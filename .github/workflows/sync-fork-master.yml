@@ -1,0 +1,42 @@
+name: Sync fork master from upstream
+
+# Keeps dan13bauer/presto's master fast-forwarded to prestodb/presto's
+# master every 15 minutes. master on this fork is expected to never carry
+# unique commits (feature work happens on separate branches), so this only
+# ever fast-forwards. If master has diverged, the check step fails the run
+# instead of force-pushing over it.
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.repository == 'dan13bauer/presto'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fetch upstream master
+        run: git fetch https://github.com/prestodb/presto.git master:refs/remotes/upstream/master
+
+      - name: Verify master has not diverged from upstream
+        run: |
+          if ! git merge-base --is-ancestor HEAD upstream/master; then
+            echo "::error::master has commit(s) that upstream/master does not. Someone pushed directly to master instead of a feature branch. Refusing to sync until this is resolved manually." >&2
+            exit 1
+          fi
+
+      - name: Fast-forward master to upstream/master
+        run: |
+          git merge --ff-only upstream/master
+          git push origin master
