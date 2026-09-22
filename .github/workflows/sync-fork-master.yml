@@ -1,10 +1,18 @@
 name: Sync fork master from upstream
 
-# Keeps dan13bauer/presto's master fast-forwarded to prestodb/presto's
-# master every 15 minutes. master on this fork is expected to never carry
-# unique commits (feature work happens on separate branches), so this only
-# ever fast-forwards. If master has diverged, the check step fails the run
-# instead of force-pushing over it.
+# Keeps dan13bauer/presto's master fast-forwarded to prestodb/presto's master
+# every 15 minutes. master on this fork is expected to never carry unique
+# commits (feature work happens on separate branches), so this only ever
+# fast-forwards. If master has diverged, the verify step fails the run instead
+# of merging or force-pushing over it.
+#
+# The fast-forward goes through the merge-upstream REST endpoint rather than
+# `git push`. GITHUB_TOKEN is a GitHub App installation token, and app tokens
+# may only write under .github/workflows with a Workflows:write permission that
+# the workflow `permissions:` block does not expose, so pushing any upstream
+# range that touches a workflow file is rejected outright. The endpoint moves
+# the ref onto objects that already exist upstream and is not subject to that
+# guard.
 
 on:
   schedule:
@@ -24,7 +32,7 @@ jobs:
         with:
           ref: master
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Fetch upstream master
         run: git fetch https://github.com/prestodb/presto.git master:refs/remotes/upstream/master
@@ -37,6 +45,16 @@ jobs:
           fi
 
       - name: Fast-forward master to upstream/master
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git merge --ff-only upstream/master
-          git push origin master
+          merge_type=$(gh api --method POST "repos/${{ github.repository }}/merge-upstream" \
+            -f branch=master --jq '.merge_type')
+          echo "merge_type=${merge_type}"
+          # The verify step rules out divergence, so anything but a
+          # fast-forward, or a no-op when master is already current, means the
+          # ref moved between that check and this call.
+          if [ "${merge_type}" != "fast-forward" ] && [ "${merge_type}" != "none" ]; then
+            echo "::error::Expected a fast-forward but the endpoint reported: ${merge_type}" >&2
+            exit 1
+          fi
