@@ -2324,6 +2324,78 @@ public abstract class AbstractTestQueries
     }
 
     @Test
+    public void testWindowClause()
+    {
+        // A named window is equivalent to the inline specification it stands for.
+        assertSameResultsAsInlineWindow(
+                "SELECT orderkey, rank() OVER w AS r FROM orders WINDOW w AS (PARTITION BY orderstatus ORDER BY orderkey) ORDER BY orderkey LIMIT 50",
+                "SELECT orderkey, rank() OVER (PARTITION BY orderstatus ORDER BY orderkey) AS r FROM orders ORDER BY orderkey LIMIT 50");
+
+        // One window shared by several window functions.
+        assertSameResultsAsInlineWindow(
+                "SELECT orderkey, rank() OVER w AS r, count(*) OVER w AS c, sum(custkey) OVER w AS s\n" +
+                        "FROM orders WINDOW w AS (PARTITION BY orderstatus ORDER BY orderkey) ORDER BY orderkey LIMIT 50",
+                "SELECT orderkey, rank() OVER (PARTITION BY orderstatus ORDER BY orderkey) AS r,\n" +
+                        "  count(*) OVER (PARTITION BY orderstatus ORDER BY orderkey) AS c,\n" +
+                        "  sum(custkey) OVER (PARTITION BY orderstatus ORDER BY orderkey) AS s\n" +
+                        "FROM orders ORDER BY orderkey LIMIT 50");
+
+        // Window chaining: w2 inherits PARTITION BY from w1 and adds an ordering.
+        assertSameResultsAsInlineWindow(
+                "SELECT orderkey, sum(custkey) OVER w1 AS total, sum(custkey) OVER w2 AS running\n" +
+                        "FROM orders WINDOW w1 AS (PARTITION BY orderstatus), w2 AS (w1 ORDER BY orderkey)\n" +
+                        "ORDER BY orderkey LIMIT 50",
+                "SELECT orderkey, sum(custkey) OVER (PARTITION BY orderstatus) AS total,\n" +
+                        "  sum(custkey) OVER (PARTITION BY orderstatus ORDER BY orderkey) AS running\n" +
+                        "FROM orders ORDER BY orderkey LIMIT 50");
+
+        // A named window refined with a frame at the point of use.
+        assertSameResultsAsInlineWindow(
+                "SELECT orderkey, sum(custkey) OVER (w ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS trailing\n" +
+                        "FROM orders WINDOW w AS (PARTITION BY orderstatus ORDER BY orderkey) ORDER BY orderkey LIMIT 50",
+                "SELECT orderkey, sum(custkey) OVER (PARTITION BY orderstatus ORDER BY orderkey ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS trailing\n" +
+                        "FROM orders ORDER BY orderkey LIMIT 50");
+
+        // A window function in ORDER BY may reference the WINDOW clause.
+        assertSameResultsAsInlineWindow(
+                "SELECT orderkey FROM orders WINDOW w AS (PARTITION BY orderstatus ORDER BY orderkey)\n" +
+                        "ORDER BY rank() OVER w, orderkey LIMIT 50",
+                "SELECT orderkey FROM orders\n" +
+                        "ORDER BY rank() OVER (PARTITION BY orderstatus ORDER BY orderkey), orderkey LIMIT 50");
+
+        // A named window in a grouped query may use aggregates and grouping columns.
+        assertSameResultsAsInlineWindow(
+                "SELECT orderstatus, rank() OVER w AS r FROM orders GROUP BY orderstatus WINDOW w AS (ORDER BY sum(custkey)) ORDER BY orderstatus",
+                "SELECT orderstatus, rank() OVER (ORDER BY sum(custkey)) AS r FROM orders GROUP BY orderstatus ORDER BY orderstatus");
+
+        // An aggregate in an unreferenced definition still makes the query an aggregation.
+        assertQuery(
+                "SELECT 1 FROM (VALUES 10, 20) T(x) WINDOW unused AS (ORDER BY sum(x))",
+                "VALUES 1");
+        assertQueryFails(
+                "SELECT x FROM (VALUES 10, 20) T(x) WINDOW unused AS (ORDER BY sum(x))",
+                "(?s).*must be an aggregate expression or appear in GROUP BY clause.*");
+
+        // A derived window may add an offset RANGE frame to an inherited ordering.
+        assertSameResultsAsInlineWindow(
+                "SELECT x, sum(y) OVER w2 FROM (VALUES (1, 10), (2, 20)) T(x, y) WINDOW w1 AS (ORDER BY x), w2 AS (w1 RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) ORDER BY x",
+                "SELECT x, sum(y) OVER (ORDER BY x RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (1, 10), (2, 20)) T(x, y) ORDER BY x");
+
+        // WINDOW is not a reserved word.
+        assertQuery("SELECT orderkey AS window FROM orders ORDER BY 1 LIMIT 5", "SELECT orderkey FROM orders ORDER BY 1 LIMIT 5");
+    }
+
+    /**
+     * Both queries must order by a unique key, so that the two executions are row for row comparable.
+     */
+    private void assertSameResultsAsInlineWindow(String namedWindowQuery, String inlineWindowQuery)
+    {
+        MaterializedResult namedWindowResult = computeActual(namedWindowQuery);
+        assertEquals(namedWindowResult, computeActual(inlineWindowQuery));
+        assertFalse(namedWindowResult.getMaterializedRows().isEmpty(), "expected a non-empty result for: " + namedWindowQuery);
+    }
+
+    @Test
     public void testRowNumberLimit()
     {
         MaterializedResult actual = computeActual("" +
